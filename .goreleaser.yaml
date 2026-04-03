@@ -19,9 +19,10 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/Shikachuu/kogia/cmd.version={{ .Version }}
-      - -X github.com/Shikachuu/kogia/cmd.commit={{ .Commit }}
-      - -X github.com/Shikachuu/kogia/cmd.date={{ .Date }}
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
+      - -X main.dockerAPIVersion={{ .Env.DOCKER_API_VERSION }}
 
   - id: kogia-cni
     main: ./cmd/kogia-cni/main.go
@@ -38,9 +39,9 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/Shikachuu/kogia/cmd.version={{ .Version }}
-      - -X github.com/Shikachuu/kogia/cmd.commit={{ .Commit }}
-      - -X github.com/Shikachuu/kogia/cmd.date={{ .Date }}
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .Commit }}
+      - -X main.date={{ .Date }}
 
 archives:
   - formats: [binary]

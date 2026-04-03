@@ -188,6 +188,10 @@ linters:
 
   exclusions:
     rules:
+      - path: 'internal/api/gen/'
+        linters:
+          - all
+
       - path: '_test\.go'
         linters:
           - gocyclo

@@ -3,6 +3,7 @@ go = "1.26.1"
 golangci-lint = "2.11.4"
 goreleaser = "2.14.3"
 trivy = "0.69.2"
+yq = "4.52.5"
 
 [settings]
 lockfile = true
@@ -30,13 +31,27 @@ run = ["golangci-lint run --config .golangci-lint.yml --fix"]
 [tasks.build]
 description = "Build a local binary"
 run = [
-    "go build -trimpath -ldflags='-s -w' -o bin/kogia cmd/kogia",
-    "go build -trimpath -ldflags='-s -w' -o bin/kogia-cni cmd/kogia-cni",
+    """go build -trimpath -ldflags="-s -w -X main.dockerAPIVersion=$(yq '.info.version' api/swagger.yaml)" -o bin/kogia ./cmd/kogia""",
+    "go build -trimpath -ldflags='-s -w' -o bin/kogia-cni ./cmd/kogia-cni",
 ]
+
+[tasks.dev]
+description = "Run kogia daemon locally for testing (state in bin/.kogia-dev/)"
+depends = ["build"]
+run = """
+mkdir -p bin/.kogia-dev/run
+bin/kogia daemon \
+  --root bin/.kogia-dev/data \
+  --socket bin/.kogia-dev/run/kogia.sock \
+  --log-level debug
+"""
 
 [tasks.release-snapshot]
 description = "Build a snapshot release with goreleaser"
-run = ["goreleaser release --snapshot --clean", "bash hack/helm-package.sh"]
+run = """
+export DOCKER_API_VERSION=$(yq '.info.version' api/swagger.yaml)
+goreleaser release --snapshot --clean
+"""
 
 [tasks.release-check]
 description = "Check goreleaser configuration"
