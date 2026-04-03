@@ -44,7 +44,8 @@ Official Docker CLI / docker compose / docker buildx
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | OCI runtime | crun (fork/exec) | Battle-tested (Podman/CRI-O), no daemon RSS cost per container |
-| Docker API types + routing | go-swagger from Docker's Swagger 2.0 spec directly | 100% spec-accurate types and routes, generated not hand-written. No conversion step. Compile-time handler contracts — missing endpoints won't compile. Update = download new swagger.yaml → regenerate. |
+| Docker API types | moby/moby/api types directly (no generation) | Identical to Docker's own types — zero drift risk. Handlers import from `github.com/moby/moby/api/types/*` sub-packages. |
+| HTTP routing | Custom generator (`hack/gen-routes`) from Docker's Swagger 2.0 spec | Reads spec with `go-openapi/loads`, emits `Handler` interface + `RegisterRoutes()` + `NotImplemented` struct using stdlib `net/http.ServeMux`. Compile-time handler contracts — missing methods won't compile. Streaming/hijack endpoints get correct `http.ResponseWriter` signatures (unlike go-swagger/oapi-codegen). Update = download new swagger.yaml → regenerate. |
 | Docker streaming helpers | moby stdcopy + jsonfilelog (imported) | Streaming protocols (attach, logs, exec) aren't well-modeled in Swagger. Import moby's battle-tested implementations for these. |
 | Image management | containers/image + containers/storage | Full Podman-grade stack. Handles registry auth, layer extraction, overlayfs whiteouts, all storage driver complexity |
 | Rootfs | containers/storage Mount/Unmount | No hand-rolled overlayfs |
@@ -57,7 +58,7 @@ Official Docker CLI / docker compose / docker buildx
 | Interface | Docker API only (Unix socket) | No MCP. `DOCKER_HOST=unix:///run/kogia.sock` |
 | CGo | Not required | bbolt is pure Go. containers/storage overlay driver uses pure Go. crun is external binary. |
 | Logging | log/slog (stdlib) | Structured JSON, zero deps, zero overhead. Forward-looking (all major runtimes use logrus but are considering migration to slog). |
-| Metrics | Prometheus + go-swagger middleware, opt-in | Off by default. `--metrics-addr=:9090` to enable. When off: 0 MB overhead, no listener, no middleware. When on: +2-3 MB RSS, ~2μs/req. Generated operation names → semantic per-endpoint metrics. Custom container lifecycle metrics added manually. |
+| Metrics | Prometheus, opt-in | Off by default. `--metrics-addr=:9090` to enable. When off: 0 MB overhead, no listener, no middleware. When on: +2-3 MB RSS, ~2μs/req. Custom container lifecycle metrics added manually. |
 
 ---
 
@@ -65,20 +66,26 @@ Official Docker CLI / docker compose / docker buildx
 
 ```
 Docker swagger.yaml (Swagger 2.0, from moby/moby repo — used directly, no conversion)
-    ↓ go-swagger generate server -f api/swagger.yaml -t internal/api/gen --exclude-main
-internal/api/gen/
-    ├── models/              ← all Docker API types (ContainerCreateBody, ImageInspect, etc.)
-    ├── restapi/             ← route registration, param binding, validation
-    └── restapi/operations/  ← one handler type per endpoint
+    ↓ hack/gen-routes (custom generator using go-openapi/loads)
+internal/api/gen/routes.go
+    ├── Handler interface    ← one method per endpoint (107 operations), plain (http.ResponseWriter, *http.Request)
+    ├── RegisterRoutes()     ← wires all routes to stdlib net/http.ServeMux
+    └── NotImplemented       ← embeddable struct providing default 501 for every method
 ```
 
-go-swagger generates:
-- **Models**: all request/response types with JSON tags + validation
-- **Operations**: one handler function type per endpoint (e.g. `container.ListContainersHandler`)
-- **Route wiring**: `configureAPI()` that registers all routes on a stdlib-compatible handler
-- **Param binding**: query params, path params, headers, body — parsed and validated
+**No go-swagger. No OpenAPI 3.0 conversion. No generated models.**
 
-We implement each handler and plug into `configureAPI()`. Streaming endpoints (attach, logs follow, events, pull progress) need manual HTTP hijack/chunked handling — use moby's `stdcopy` for the wire format.
+Docker API types come directly from `github.com/moby/moby/api/types/*` — the same types Docker itself uses. Handlers import from moby's sub-packages (`types/system`, `types/container`, etc.) and encode/decode JSON themselves.
+
+The custom generator (`hack/gen-routes/main.go`) was chosen over go-swagger and oapi-codegen because:
+- **Streaming endpoints** (attach, exec, logs, events) use HTTP hijacking that can't be modeled in OpenAPI. go-swagger/oapi-codegen produce wrong handler signatures for these. Our generator emits standard `(http.ResponseWriter, *http.Request)` — handlers can hijack as needed.
+- **go-swagger's generated models** conflict with moby's types (`x-go-type` extensions, inline schema extraction, validation interfaces). Using moby types directly eliminates all compatibility issues.
+- **Moby's own OpenAPI 3.0 migration** (PR #51565) is still unmerged after 4+ months, confirming spec conversion is non-trivial.
+- **Zero framework dependencies.** Just stdlib `net/http`, `encoding/json`, and moby types.
+
+The `NotImplemented` struct allows incremental implementation: embed it in the handler struct, override methods as each endpoint is implemented. Unimplemented endpoints return `501 Not Implemented` with a JSON error body.
+
+Streaming endpoints (attach, logs follow, events, pull progress) need manual HTTP hijack/chunked handling — use moby's `stdcopy` for the wire format.
 
 ---
 
@@ -87,9 +94,13 @@ We implement each handler and plug into `configureAPI()`. Streaming endpoints (a
 ```
 kogia/
 ├── go.mod
-├── mise.toml                        # tool versions + task runner (includes go-swagger generate task)
+├── mise.toml                        # tool versions + task runner
 ├── api/
 │   └── swagger.yaml                 # Docker API spec (Swagger 2.0, from moby/moby — used directly)
+├── hack/
+│   ├── download-swagger.sh          # downloads swagger.yaml from moby (version from go.mod)
+│   └── gen-routes/
+│       └── main.go                  # custom route generator (go-openapi/loads → routes.go)
 ├── cmd/
 │   ├── kogia/
 │   │   └── main.go                  # cobra CLI, daemon subcommand
@@ -99,11 +110,12 @@ kogia/
 │   ├── daemon/
 │   │   └── daemon.go                # startup orchestrator, signal handling, shutdown sequence
 │   ├── api/
-│   │   ├── gen/                     # GENERATED by go-swagger (do not edit)
-│   │   │   ├── models/             # all Docker API types
-│   │   │   └── restapi/            # route wiring, param binding, operations
+│   │   ├── gen/                     # GENERATED by hack/gen-routes (do not edit)
+│   │   │   ├── gen.go               # go:generate directive
+│   │   │   └── routes.go            # Handler interface, RegisterRoutes(), NotImplemented
 │   │   ├── server.go                # net/http server setup, middleware, Unix socket listener
 │   │   └── handlers/
+│   │       ├── respond.go           # generic respondJSON[T] helper
 │   │       ├── container.go         # container CRUD, logs, attach, resize, wait
 │   │       ├── exec.go              # exec create/start/inspect
 │   │       ├── image.go             # pull, list, inspect, remove, tag
@@ -153,16 +165,12 @@ kogia/
 ## Dependencies
 
 ```
-# Docker API — generated types + routes (from Swagger 2.0 directly)
-github.com/go-openapi/runtime         # runtime helpers for go-swagger generated code
-github.com/go-openapi/errors          # error types used by generated code
-github.com/go-openapi/loads           # spec loading
-github.com/go-openapi/strfmt          # format types (date-time, uri, etc.)
+# Docker API types (used directly, not generated)
+github.com/moby/moby/api             # Docker API types from moby's own packages (types/system, types/container, etc.)
 
-# Docker streaming helpers (NOT types — those are generated)
-github.com/docker/docker/pkg/stdcopy       # multiplexed stream format (attach, logs, exec)
-github.com/docker/docker/daemon/logger     # jsonfilelog format for container logs
-github.com/docker/docker/profiles/seccomp  # default seccomp profile
+# Docker streaming helpers
+github.com/moby/moby/v2/pkg/stdcopy       # multiplexed stream format (attach, logs, exec)
+github.com/moby/moby/v2/daemon/logger     # jsonfilelog format for container logs
 
 # Image + storage
 github.com/containers/image/v5       # registry pull, auth, manifest parsing
@@ -196,7 +204,7 @@ golang.org/x/sys                      # Linux syscalls
 
 ### Build-time tools (not Go dependencies)
 ```
-github.com/go-swagger/go-swagger      # generates types + server from Swagger 2.0 directly (go install)
+github.com/go-openapi/loads           # used by hack/gen-routes to parse swagger.yaml at generation time
 ```
 
 ---
@@ -260,26 +268,29 @@ Deferred to v2. Not needed for standalone Docker replacement. Can add OTel behin
 
 ## Implementation Phases
 
-### Phase 0: Skeleton
+### Phase 0: Skeleton ✅
 **Goal:** `docker version`, `docker info`, `docker ps` work.
 
-**Create:**
-- `go.mod`, `mise.toml` (Go version, go-swagger, crun download task, build task, `generate` task)
-- `api/swagger.yaml` — Docker's swagger.yaml from moby/moby repo (Swagger 2.0, used directly)
-- Run `swagger generate server -f api/swagger.yaml -t internal/api/gen --exclude-main` to generate models + restapi + operations
-- `cmd/kogia/main.go` — cobra CLI with `daemon` subcommand. Flags: `--socket`, `--root`, `--log-level`, `--metrics-addr`
-- `internal/daemon/daemon.go` — create dirs, open bbolt, init managers, start HTTP server on Unix socket, signal handler (SIGTERM/SIGINT → graceful shutdown)
-- `internal/api/server.go` — net/http server setup, wraps generated handler with middleware (API version extraction from `/v{version}/...` prefix, error formatting as `{"message":"..."}`, request logging). Version prefix stripping happens in middleware before hitting generated routes.
-- `internal/api/handlers/system.go` — implement generated handler interfaces for `SystemPing` (returns `"OK"` + `Api-Version`, `Docker-Experimental`, `OSType`, `Server` headers), `SystemVersion` (version JSON), `SystemInfo` (basic host data)
-- `internal/api/handlers/container.go` — stub `ContainerList` handler returning `[]`
-- `internal/store/db.go` — bbolt init with buckets: `containers`, `images`, `networks`, `volumes`, `ipam`, `meta`
+**Implemented:**
+- `go.mod`, `mise.toml` (Go 1.26.1, golangci-lint, goreleaser, trivy, yq — build task injects Docker API version from swagger spec via ldflags)
+- `api/swagger.yaml` — Docker's swagger.yaml (API v1.54), downloaded from moby/moby via `hack/download-swagger.sh` (version derived from `github.com/moby/moby/v2` in go.mod)
+- `hack/gen-routes/main.go` — custom code generator reads swagger spec with `go-openapi/loads`, emits `internal/api/gen/routes.go` with 107 operations (Handler interface + RegisterRoutes + NotImplemented). Regenerate with `mise run gogen`.
+- `cmd/kogia/main.go` — cobra CLI with `daemon` subcommand. Flags: `--socket`, `--root`, `--log-level`. Docker API version injected at build time via ldflags.
+- `internal/daemon/daemon.go` — create dirs, write PID file, open bbolt, init handlers, start HTTP server on Unix socket, signal handler (SIGTERM/SIGINT → graceful shutdown with 5s timeout)
+- `internal/api/server.go` — net/http server setup using stdlib `ServeMux`, middleware chain: API version prefix rewriting (`/v{any}/...` → `/v{dockerAPIVersion}/...` + bare `/_ping`), request logging (slog), panic recovery. Routes wired via `gen.RegisterRoutes()`.
+- `internal/api/handlers/system.go` — `SystemPing` (returns `"OK"` + Docker headers), `SystemPingHead`, `SystemVersion` (JSON-encoded `system.VersionResponse` from moby types), `SystemInfo` (JSON-encoded `system.Info`). Daemon ID generated once and persisted in bbolt.
+- `internal/api/handlers/container.go` — `ContainerList` returns typed empty `[]*container.Summary{}`
+- `internal/api/handlers/respond.go` — generic `respondJSON[T]` helper for type-safe JSON responses
+- `internal/api/handlers/handlers.go` — `Handlers` struct embeds `gen.NotImplemented` for default 501 on all unimplemented endpoints
+- `internal/store/db.go` — bbolt init with `meta` bucket (other buckets added in later phases)
+- All 102 unimplemented endpoints return `501 Not Implemented` with JSON error body
 
-**Note on version prefix:** Docker CLI sends requests like `/v1.47/containers/json`. The generated routes may or may not include version prefixes depending on how the swagger spec defines `basePath`. Handle with middleware that strips `/v{version}/` before dispatching to the generated handler if needed.
+**Note on version prefix:** Docker CLI sends requests like `/v1.47/containers/json`. Middleware rewrites any `/v{version}/` prefix to the basePath from the swagger spec (`/v1.54/`) before dispatching to the `ServeMux`. Bare `/_ping` is also handled.
 
 **Verify:**
 ```bash
-export DOCKER_HOST=unix:///run/kogia.sock
-sudo kogia daemon &
+mise run build && mise run dev &
+export DOCKER_HOST=unix://$(pwd)/bin/.kogia-dev/run/kogia.sock
 docker version && docker info && docker ps
 ```
 
@@ -514,7 +525,7 @@ SIGTERM/SIGINT received →
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| **Docker API fidelity** — undocumented CLI expectations beyond swagger spec | High | go-swagger gives us spec coverage; use socat traffic capture for undocumented behavior; golden-file tests |
+| **Docker API fidelity** — undocumented CLI expectations beyond swagger spec | High | Custom route generator covers all 107 spec operations; moby types ensure response format matches Docker exactly; use socat traffic capture for undocumented behavior; golden-file tests |
 | **Streaming endpoints** — 4 protocols (logs, attach, pull progress, build session) | High | Import moby's stdcopy. Implement in order of difficulty. |
 | **spec.go complexity** — Docker→OCI config translation is ~800 LOC of edge cases | High | Start minimal (hello-world), expand iteratively. Extensive unit tests. |
 | **containers/storage edge cases** — whiteouts, opaque dirs, metacopy | Medium | Battle-tested library handles this. Trust it. |
