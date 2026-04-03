@@ -1,0 +1,117 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: kogia
+
+builds:
+  - id: kogia
+    main: ./cmd/kogia/main.go
+    binary: bin/{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}
+    no_unique_dist_dir: true
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/Shikachuu/kogia/cmd.version={{ .Version }}
+      - -X github.com/Shikachuu/kogia/cmd.commit={{ .Commit }}
+      - -X github.com/Shikachuu/kogia/cmd.date={{ .Date }}
+
+  - id: kogia-cni
+    main: ./cmd/kogia-cni/main.go
+    binary: bin/{{ .ProjectName }}-cni-{{ .Os }}-{{ .Arch }}
+    no_unique_dist_dir: true
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/Shikachuu/kogia/cmd.version={{ .Version }}
+      - -X github.com/Shikachuu/kogia/cmd.commit={{ .Commit }}
+      - -X github.com/Shikachuu/kogia/cmd.date={{ .Date }}
+
+archives:
+  - formats: [binary]
+    name_template: "{{ .Binary }}"
+    allow_different_binary_count: false
+
+sboms:
+  - artifacts: binary
+    cmd: trivy
+    args:
+      - "rootfs"
+      - "--format"
+      - "spdx-json"
+      - "--output"
+      - "$document"
+      - "$artifact"
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: ✨ Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: 🐛 Bug Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: ⚡ Performance Improvements
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: ♻️ Code Refactoring
+      regexp: '^.*?refactor(\([[:word:]]+\))??!?:.+$'
+      order: 3
+    - title: 📦 Build System
+      regexp: '^.*?build(\([[:word:]]+\))??!?:.+$'
+      order: 4
+    - title: 📚 Documentation
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 5
+    - title: ✅ Tests
+      regexp: '^.*?test(\([[:word:]]+\))??!?:.+$'
+      order: 6
+    - title: 🔧 Miscellaneous
+      regexp: '^.*?chore(\([[:word:]]+\))??!?:.+$'
+      order: 7
+    - title: ⏪ Reverts
+      regexp: '^.*?revert(\([[:word:]]+\))??!?:.+$'
+      order: 8
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: Shikachuu
+    name: kogia
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## Kogia {{ .Tag }} ({{ .Date }})
+    ```
+  footer: |
+    **Full Changelog**: https://github.com/Shikachuu/kogia/compare/{{ .PreviousTag }}...{{ .Tag }}

@@ -1,0 +1,43 @@
+[tools]
+go = "1.26.1"
+golangci-lint = "2.11.4"
+goreleaser = "2.14.3"
+trivy = "0.69.2"
+
+[settings]
+lockfile = true
+auto_install = true
+experimental = true
+task_output = "quiet"
+
+[tasks.gogen]
+description = "Runs go generate for all files"
+run = "go generate ./..."
+
+[tasks.secu-scan]
+description = "Runs trivy security checks (vulnerability, secret leaks, miss-configs)"
+run = "trivy fs . --scanners vuln,secret"
+
+[tasks.test]
+env = { "CGO_ENABLED" = "0" }
+description = "Run tests"
+run = "go test ./... -cover"
+
+[tasks.lint]
+description = "Lint golang and protobuf code"
+run = ["golangci-lint run --config .golangci-lint.yml --fix"]
+
+[tasks.build]
+description = "Build a local binary"
+run = [
+    "go build -trimpath -ldflags='-s -w' -o bin/kogia cmd/kogia",
+    "go build -trimpath -ldflags='-s -w' -o bin/kogia-cni cmd/kogia-cni",
+]
+
+[tasks.release-snapshot]
+description = "Build a snapshot release with goreleaser"
+run = ["goreleaser release --snapshot --clean", "bash hack/helm-package.sh"]
+
+[tasks.release-check]
+description = "Check goreleaser configuration"
+run = "goreleaser check"
