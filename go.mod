@@ -9,6 +9,7 @@ require (
 	github.com/go-openapi/spec v0.22.4
 	github.com/moby/docker-image-spec v1.3.1
 	github.com/moby/moby/api v1.54.1
+	github.com/opencontainers/runtime-spec v1.2.1
 	github.com/spf13/cobra v1.10.2
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/sys v0.42.0
@@ -75,7 +76,6 @@ require (
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
-	github.com/opencontainers/runtime-spec v1.2.1 // indirect
 	github.com/opencontainers/selinux v1.12.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/proglottis/gpgme v0.1.4 // indirect

@@ -1,12 +1,526 @@
 package handlers
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
+	clog "github.com/Shikachuu/kogia/internal/log"
+	"github.com/Shikachuu/kogia/internal/log/jsonfile"
+	"github.com/Shikachuu/kogia/internal/runtime"
+	"github.com/Shikachuu/kogia/internal/store"
 	"github.com/moby/moby/api/types/container"
 )
 
+// isNotFound returns true if the error chain contains store.ErrNotFound.
+func isNotFound(err error) bool {
+	return errors.Is(err, store.ErrNotFound)
+}
+
+// ErrHijackUnsupported is returned when the HTTP server does not support connection hijacking.
+var ErrHijackUnsupported = errors.New("webserver does not support hijacking")
+
+const queryValueTrue = "true"
+
+// ContainerCreate handles POST /containers/create.
+func (h *Handlers) ContainerCreate(w http.ResponseWriter, r *http.Request) {
+	var req container.CreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errorJSON(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+
+	if req.Config == nil {
+		errorJSON(w, http.StatusBadRequest, runtime.ErrConfigRequired)
+
+		return
+	}
+
+	id, err := h.runtime.Create(r.Context(), req.Config, req.HostConfig, name)
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, container.CreateResponse{
+		ID:       id,
+		Warnings: []string{},
+	})
+}
+
+// ContainerStart handles POST /containers/{id}/start.
+func (h *Handlers) ContainerStart(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	err := h.runtime.Start(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, runtime.ErrAlreadyRunning) {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerStop handles POST /containers/{id}/stop.
+func (h *Handlers) ContainerStop(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	timeout := runtime.DefaultStopTimeout
+
+	if t := r.URL.Query().Get("t"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil {
+			timeout = v
+		}
+	}
+
+	if err := h.runtime.Stop(r.Context(), id, timeout); err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerKill handles POST /containers/{id}/kill.
+func (h *Handlers) ContainerKill(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	signal := r.URL.Query().Get("signal")
+
+	if signal == "" {
+		signal = runtime.DefaultKillSignal
+	}
+
+	if err := h.runtime.Kill(r.Context(), id, signal); err != nil {
+		if errors.Is(err, runtime.ErrNotRunning) {
+			errorJSON(w, http.StatusConflict, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerRestart handles POST /containers/{id}/restart.
+func (h *Handlers) ContainerRestart(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	timeout := runtime.DefaultStopTimeout
+
+	if t := r.URL.Query().Get("t"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil {
+			timeout = v
+		}
+	}
+
+	if err := h.runtime.Restart(r.Context(), id, timeout); err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerWait handles POST /containers/{id}/wait.
+// Docker CLI sends wait before start. We must flush the 200 status immediately
+// so the HTTP connection is unblocked, then write the JSON body only when the
+// container exits. This allows the CLI to pipeline start on another connection.
+func (h *Handlers) ContainerWait(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	// Verify container exists before committing to streaming response.
+	if _, err := h.runtime.Inspect(r.Context(), id); err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	// Send 200 OK + headers immediately, then keep connection open.
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// Block until container exits.
+	exitCode, err := h.runtime.Wait(r.Context(), id)
+	if err != nil {
+		// Can't change status code after headers are sent — write error in body.
+		_ = json.NewEncoder(w).Encode(container.WaitResponse{
+			StatusCode: -1,
+			Error:      &container.WaitExitError{Message: err.Error()},
+		})
+
+		return
+	}
+
+	_ = json.NewEncoder(w).Encode(container.WaitResponse{
+		StatusCode: int64(exitCode),
+	})
+}
+
+// ContainerDelete handles DELETE /containers/{id}.
+func (h *Handlers) ContainerDelete(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == queryValueTrue
+
+	if err := h.runtime.Remove(r.Context(), id, force); err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		if errors.Is(err, runtime.ErrContainerRunning) {
+			errorJSON(w, http.StatusConflict, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ContainerList handles GET /containers/json.
-func (h *Handlers) ContainerList(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, http.StatusOK, []*container.Summary{})
+func (h *Handlers) ContainerList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	filters := store.ContainerFilters{
+		All: q.Get("all") == "1" || q.Get("all") == queryValueTrue,
+	}
+
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			filters.Limit = n
+		}
+	}
+
+	// Parse Docker-style JSON filters.
+	if raw := q.Get("filters"); raw != "" {
+		var f map[string][]string
+		if err := json.Unmarshal([]byte(raw), &f); err == nil {
+			filters.ID = f["id"]
+			filters.Name = f["name"]
+			filters.Status = f["status"]
+			filters.Label = f["label"]
+			filters.Ancestor = f["ancestor"]
+		}
+	}
+
+	records, err := h.runtime.List(r.Context(), &filters)
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	summaries := make([]*container.Summary, 0, len(records))
+	for _, rec := range records {
+		summaries = append(summaries, inspectToSummary(rec))
+	}
+
+	respondJSON(w, http.StatusOK, summaries)
+}
+
+// ContainerInspect handles GET /containers/{id}/json.
+func (h *Handlers) ContainerInspect(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	resp, err := h.runtime.Inspect(r.Context(), id)
+	if err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	respondJSON(w, http.StatusOK, resp)
+}
+
+// ContainerLogs handles GET /containers/{id}/logs.
+func (h *Handlers) ContainerLogs(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	record, err := h.runtime.Inspect(r.Context(), id)
+	if err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	opts := parseLogOpts(r)
+	maxFiles := logMaxFiles(record)
+
+	reader, err := jsonfile.ReadLogsFrom(record.LogPath, maxFiles, opts)
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+	defer reader.Close()
+
+	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+
+	for msg := range reader.Lines {
+		writeStdcopyFrame(w, msg)
+
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+}
+
+func parseLogOpts(r *http.Request) clog.ReadOpts {
+	q := r.URL.Query()
+	opts := clog.ReadOpts{
+		Stdout: q.Get("stdout") != "false" && q.Get("stdout") != "0",
+		Stderr: q.Get("stderr") != "false" && q.Get("stderr") != "0",
+		Tail:   -1,
+	}
+
+	if v := q.Get("tail"); v != "" && v != "all" {
+		if n, parseErr := strconv.Atoi(v); parseErr == nil {
+			opts.Tail = n
+		}
+	}
+
+	if v := q.Get("since"); v != "" {
+		if t, parseErr := parseSince(v); parseErr == nil {
+			opts.Since = t
+		}
+	}
+
+	if v := q.Get("until"); v != "" {
+		if t, parseErr := parseSince(v); parseErr == nil {
+			opts.Until = t
+		}
+	}
+
+	return opts
+}
+
+func logMaxFiles(record *container.InspectResponse) int {
+	if record.HostConfig != nil && record.HostConfig.LogConfig.Config != nil {
+		if v, ok := record.HostConfig.LogConfig.Config["max-file"]; ok {
+			n, _ := strconv.Atoi(v)
+
+			return n
+		}
+	}
+
+	return 0
+}
+
+// writeStdcopyFrame writes a Docker stdcopy multiplexed frame.
+func writeStdcopyFrame(w http.ResponseWriter, msg *clog.Message) {
+	// stdout = 1, stderr = 2.
+	streamType := byte(1)
+	if msg.Stream == "stderr" {
+		streamType = 2
+	}
+
+	payload := msg.Line
+
+	// stdcopy header: [stream_type, 0, 0, 0, size(4 bytes big-endian)].
+	header := [8]byte{streamType}
+	size := uint32(len(payload)) //nolint:gosec // Log line length is bounded by scanner buffer size.
+	header[4] = byte(size >> 24)
+	header[5] = byte(size >> 16) //nolint:gosec // Byte truncation is intentional for big-endian encoding.
+	header[6] = byte(size >> 8)  //nolint:gosec // Byte truncation is intentional for big-endian encoding.
+	header[7] = byte(size)       //nolint:gosec // Byte truncation is intentional for big-endian encoding.
+
+	_, _ = w.Write(header[:]) //nolint:gosec // Response writer errors are handled by the HTTP server.
+	_, _ = w.Write(payload)   //nolint:gosec // Response writer errors are handled by the HTTP server.
+}
+
+// inspectToSummary converts an InspectResponse to a container Summary for listing.
+func inspectToSummary(c *container.InspectResponse) *container.Summary {
+	s := &container.Summary{
+		ID:    c.ID,
+		Names: []string{c.Name},
+		Image: "",
+	}
+
+	if c.Config != nil {
+		s.Image = c.Config.Image
+		s.Labels = c.Config.Labels
+
+		// Build command string.
+		if len(c.Config.Cmd) > 0 {
+			s.Command = strings.Join(c.Config.Cmd, " ")
+		}
+	}
+
+	s.ImageID = c.Image
+
+	// Parse created time.
+	if t, err := time.Parse(time.RFC3339Nano, c.Created); err == nil {
+		s.Created = t.Unix()
+	}
+
+	if c.State != nil {
+		s.State = c.State.Status
+		s.Status = formatStatus(c.State)
+	}
+
+	s.Mounts = c.Mounts
+
+	return s
+}
+
+func formatStatus(state *container.State) string {
+	switch state.Status {
+	case container.StateRunning:
+		if t, err := time.Parse(time.RFC3339Nano, state.StartedAt); err == nil {
+			return fmt.Sprintf("Up %s", time.Since(t).Truncate(time.Second))
+		}
+
+		return "Up"
+	case container.StateExited:
+		exitStr := fmt.Sprintf("Exited (%d)", state.ExitCode)
+
+		if t, err := time.Parse(time.RFC3339Nano, state.FinishedAt); err == nil {
+			return fmt.Sprintf("%s %s ago", exitStr, time.Since(t).Truncate(time.Second))
+		}
+
+		return exitStr
+	case container.StateCreated:
+		return "Created"
+	case container.StateRestarting:
+		return "Restarting"
+	default:
+		return string(state.Status)
+	}
+}
+
+// parseSince parses a Docker "since" parameter, which can be a Unix timestamp
+// (integer or float) or an RFC3339 time.
+func parseSince(s string) (time.Time, error) {
+	// Try as Unix timestamp (integer).
+	if ts, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return time.Unix(ts, 0), nil
+	}
+
+	// Try as Unix timestamp (float).
+	if ts, err := strconv.ParseFloat(s, 64); err == nil {
+		sec := int64(ts)
+		nsec := int64((ts - float64(sec)) * 1e9)
+
+		return time.Unix(sec, nsec), nil
+	}
+
+	// Try as duration (e.g., "5m").
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d), nil
+	}
+
+	// Try as RFC3339.
+	if t, parseErr := time.Parse(time.RFC3339, s); parseErr == nil {
+		return t, nil
+	}
+
+	// Try as RFC3339Nano (e.g., "2024-01-15T10:30:00.123456789Z").
+	t, parseErr := time.Parse(time.RFC3339Nano, s)
+	if parseErr != nil {
+		return time.Time{}, fmt.Errorf("parse time %q: %w", s, parseErr)
+	}
+
+	return t, nil
+}
+
+// ContainerAttach handles POST /containers/{id}/attach.
+// Full interactive attach is Phase 3. This minimal implementation supports
+// the Docker CLI's `docker run -d` flow, which sends an attach request before
+// starting the container. We upgrade to raw stream and immediately close it.
+func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	// Verify the container exists.
+	if _, err := h.runtime.Inspect(r.Context(), id); err != nil {
+		if isNotFound(err) {
+			errorJSON(w, http.StatusNotFound, err)
+
+			return
+		}
+
+		errorJSON(w, http.StatusInternalServerError, err)
+
+		return
+	}
+
+	// Upgrade to raw stream (Docker CLI expects this).
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		errorJSON(w, http.StatusInternalServerError, ErrHijackUnsupported)
+
+		return
+	}
+
+	conn, buf, err := hijacker.Hijack()
+	if err != nil {
+		errorJSON(w, http.StatusInternalServerError, fmt.Errorf("hijack: %w", err))
+
+		return
+	}
+
+	// Send the HTTP 200 + upgrade headers that Docker CLI expects.
+	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\n")
+	_, _ = buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
+	_, _ = buf.WriteString("Connection: Upgrade\r\n")
+	_, _ = buf.WriteString("Upgrade: tcp\r\n")
+	_, _ = buf.WriteString("\r\n")
+	_ = buf.Flush()
+
+	// Close immediately — the container will run detached.
+	_ = conn.Close()
 }

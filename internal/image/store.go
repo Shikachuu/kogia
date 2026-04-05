@@ -420,6 +420,36 @@ func (s *Store) populateFromOCIConfig(img *storage.Image, resp *imagetypes.Inspe
 	}
 }
 
+// Config holds the OCI image configuration fields needed by the runtime.
+type Config struct {
+	WorkingDir string
+	User       string
+	Env        []string
+	Entrypoint []string
+	Cmd        []string
+}
+
+// GetConfig returns the OCI config fields needed for container creation.
+func (s *Store) GetConfig(nameOrID string) (*Config, error) {
+	img, err := s.resolve(nameOrID)
+	if err != nil {
+		return nil, err
+	}
+
+	ociCfg, err := s.readOCIConfig(img)
+	if err != nil {
+		return nil, fmt.Errorf("image: read config for %s: %w", nameOrID, err)
+	}
+
+	return &Config{
+		Env:        ociCfg.Config.Env,
+		Entrypoint: ociCfg.Config.Entrypoint,
+		Cmd:        ociCfg.Config.Cmd,
+		WorkingDir: ociCfg.Config.WorkingDir,
+		User:       ociCfg.Config.User,
+	}, nil
+}
+
 // parseOCIConfig unmarshals raw JSON into a DockerOCIImage.
 func parseOCIConfig(data []byte) (*dockerspec.DockerOCIImage, error) {
 	var cfg dockerspec.DockerOCIImage

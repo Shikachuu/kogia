@@ -11,6 +11,9 @@ auto_install = true
 experimental = true
 task_output = "quiet"
 
+[env]
+CRUN_VERSION = "1.27"
+
 [tasks.gogen]
 description = "Runs go generate for all files"
 run = "go generate ./..."
@@ -28,16 +31,32 @@ run = "go test -tags containers_image_openpgp ./... -cover"
 description = "Lint golang and protobuf code"
 run = ["golangci-lint run --config .golangci-lint.yml --fix"]
 
+[tasks.download-crun]
+description = "Download static crun binaries into embed/"
+run = "hack/download-crun.sh"
+
 [tasks.build]
 description = "Build a local binaries"
+depends = ["download-crun"]
 run = "goreleaser build --clean --snapshot"
 
 [tasks.dev]
 description = "Run kogia daemon locally for testing (state in bin/.kogia-dev/)"
 depends = ["build"]
 run = """
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64)  GOARCH=amd64 ;;
+  aarch64|arm64) GOARCH=arm64 ;;
+  *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
+esac
+BINARY="bin/kogia-linux-${GOARCH}"
+if [ ! -f "$BINARY" ]; then
+  echo "error: $BINARY not found (did 'mise run build' succeed?)" >&2
+  exit 1
+fi
 mkdir -p bin/.kogia-dev/run
-bin/kogia daemon \
+exec "$BINARY" daemon \
   --root bin/.kogia-dev/data \
   --socket bin/.kogia-dev/run/kogia.sock \
   --log-level debug

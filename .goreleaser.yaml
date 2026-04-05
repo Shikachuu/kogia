@@ -3,6 +3,10 @@ version: 2
 
 project_name: kogia
 
+before:
+  hooks:
+    - hack/download-crun.sh
+
 builds:
   - id: kogia
     main: ./cmd/kogia

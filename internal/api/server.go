@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -215,4 +216,22 @@ func (rw *responseWriter) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// errHijackUnsupported is returned when the underlying ResponseWriter does not support hijacking.
+var errHijackUnsupported = errors.New("api: underlying ResponseWriter does not support hijacking")
+
+// Hijack delegates to the underlying ResponseWriter for connection upgrades.
+// Required for attach, exec, and other endpoints that upgrade to raw TCP streams.
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		conn, buf, err := h.Hijack()
+		if err != nil {
+			return nil, nil, fmt.Errorf("api: hijack: %w", err)
+		}
+
+		return conn, buf, nil
+	}
+
+	return nil, nil, errHijackUnsupported
 }

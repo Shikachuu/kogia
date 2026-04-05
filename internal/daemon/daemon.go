@@ -10,9 +10,11 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Shikachuu/kogia/embed"
 	"github.com/Shikachuu/kogia/internal/api"
 	"github.com/Shikachuu/kogia/internal/api/handlers"
 	"github.com/Shikachuu/kogia/internal/image"
+	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
 )
 
@@ -48,6 +50,21 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	defer func() { _ = os.Remove(pidPath) }()
 
+	// Extract embedded crun binary.
+	crunPath := filepath.Join(socketDir, "crun")
+
+	if err := extractCrun(crunPath); err != nil {
+		return fmt.Errorf("daemon: extract crun: %w", err)
+	}
+
+	defer func() { _ = os.Remove(crunPath) }()
+
+	// Set up subreaper so we receive SIGCHLD for orphaned container processes.
+	if err := runtime.SetSubreaper(); err != nil {
+		slog.Warn("failed to set subreaper (container supervision may not work)", "err", err)
+	}
+
+	// Open bbolt state store.
 	dbPath := filepath.Join(cfg.RootDir, "kogia.db")
 
 	s, err := store.New(dbPath)
@@ -61,6 +78,7 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}()
 
+	// Open image store.
 	images, err := image.NewStore(image.StoreOptions{
 		GraphRoot: filepath.Join(cfg.RootDir, "image"),
 		RunRoot:   filepath.Join(socketDir, "image"),
@@ -76,7 +94,35 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}()
 
-	h := handlers.New(s, images, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
+	// Initialize runtime manager.
+	crunRootDir := filepath.Join(socketDir, "crun-state")
+
+	if mkdirErr := os.MkdirAll(crunRootDir, 0o710); mkdirErr != nil {
+		return fmt.Errorf("daemon: mkdir crun root: %w", mkdirErr)
+	}
+
+	bundleRoot := filepath.Join(cfg.RootDir, "containers")
+
+	if mkdirErr := os.MkdirAll(bundleRoot, 0o710); mkdirErr != nil {
+		return fmt.Errorf("daemon: mkdir bundle root: %w", mkdirErr)
+	}
+
+	rt := runtime.NewManager(runtime.ManagerConfig{
+		CrunBinary: crunPath,
+		CrunRoot:   crunRootDir,
+		BundleRoot: bundleRoot,
+		Store:      s,
+		Images:     images,
+	})
+
+	// Clean up containers orphaned by a previous crash.
+	rt.RecoverOrphans(ctx)
+
+	// Start process reaper.
+	rt.StartReaper(ctx)
+
+	// Create HTTP handlers and server.
+	h := handlers.New(s, images, rt, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
 	srv := api.New(cfg.SocketPath, cfg.DockerAPIVersion, h)
 
 	if err = srv.Start(); err != nil {
@@ -93,6 +139,7 @@ func Run(ctx context.Context, cfg *Config) error {
 
 	slog.Info("shutting down...")
 
+	// Stop accepting new connections.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -100,19 +147,37 @@ func Run(ctx context.Context, cfg *Config) error {
 		slog.Error("server shutdown error", "err", err)
 	}
 
+	// Stop all running containers.
+	rt.Shutdown(context.Background(), 10) //nolint:contextcheck // Fresh context for graceful shutdown after parent cancel.
+
+	return nil
+}
+
+// extractCrun writes the embedded crun binary to disk.
+func extractCrun(path string) error {
+	data, err := embed.Crun()
+	if err != nil {
+		return fmt.Errorf("read embedded crun: %w", err)
+	}
+
+	//nolint:gosec // crun binary needs to be executable.
+	if writeErr := os.WriteFile(path, data, 0o755); writeErr != nil {
+		return fmt.Errorf("write crun: %w", writeErr)
+	}
+
 	return nil
 }
 
 func writePID(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o710); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+	if mkdirErr := os.MkdirAll(filepath.Dir(path), 0o710); mkdirErr != nil {
+		return fmt.Errorf("mkdir: %w", mkdirErr)
 	}
 
 	pid := strconv.Itoa(os.Getpid())
 
 	//nolint:gosec // PID file needs to be readable by other processes.
-	if err := os.WriteFile(path, []byte(pid), 0o640); err != nil {
-		return fmt.Errorf("write: %w", err)
+	if writeErr := os.WriteFile(path, []byte(pid), 0o640); writeErr != nil {
+		return fmt.Errorf("write: %w", writeErr)
 	}
 
 	return nil

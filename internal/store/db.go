@@ -29,9 +29,13 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
 
+	buckets := []string{bucketMeta, bucketContainers, bucketContNames, bucketContBundles}
+
 	if err = db.Update(func(tx *bolt.Tx) error {
-		if _, berr := tx.CreateBucketIfNotExists([]byte(bucketMeta)); berr != nil {
-			return fmt.Errorf("create bucket %q: %w", bucketMeta, berr)
+		for _, name := range buckets {
+			if _, berr := tx.CreateBucketIfNotExists([]byte(name)); berr != nil {
+				return fmt.Errorf("create bucket %q: %w", name, berr)
+			}
 		}
 
 		return nil

@@ -152,8 +152,8 @@ func generate(root string, routes []route) []byte {
 
 	var buf bytes.Buffer
 
-	if err := tmpl.Execute(&buf, routes); err != nil {
-		log.Fatalf("executing template: %v", err)
+	if execErr := tmpl.Execute(&buf, routes); execErr != nil {
+		log.Fatalf("executing template: %v", execErr)
 	}
 
 	return buf.Bytes()

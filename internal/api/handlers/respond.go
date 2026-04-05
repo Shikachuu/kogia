@@ -21,7 +21,7 @@ func respondJSON[T any](w http.ResponseWriter, status int, v T) {
 // This is needed because the slashy-path middleware encodes slashes in image
 // names as %2F for ServeMux matching — PathValue returns the encoded form.
 //
-//nolint:unparam // key will vary across handlers as more endpoints are implemented.
+
 func pathValue(r *http.Request, key string) string {
 	v := r.PathValue(key)
 
