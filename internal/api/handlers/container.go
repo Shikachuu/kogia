@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Shikachuu/kogia/internal/api/errdefs"
+	"github.com/Shikachuu/kogia/internal/image"
 	clog "github.com/Shikachuu/kogia/internal/log"
 	"github.com/Shikachuu/kogia/internal/log/jsonfile"
 	"github.com/Shikachuu/kogia/internal/runtime"
@@ -30,22 +32,45 @@ const queryValueTrue = "true"
 func (h *Handlers) ContainerCreate(w http.ResponseWriter, r *http.Request) {
 	var req container.CreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		errorJSON(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		respondError(w, errdefs.InvalidParameter("invalid request body", err))
 
 		return
 	}
 
 	name := r.URL.Query().Get("name")
 
-	if req.Config == nil {
-		errorJSON(w, http.StatusBadRequest, runtime.ErrConfigRequired)
+	if name != "" {
+		if err := validateContainerName(name); err != nil {
+			respondError(w, err)
+
+			return
+		}
+	}
+
+	if err := validateContainerConfig(req.Config); err != nil {
+		respondError(w, err)
 
 		return
 	}
 
+	if req.HostConfig != nil {
+		if err := validateHostConfig(req.HostConfig); err != nil {
+			respondError(w, err)
+
+			return
+		}
+	}
+
 	id, err := h.runtime.Create(r.Context(), req.Config, req.HostConfig, name)
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		switch {
+		case errors.Is(err, store.ErrNameInUse):
+			respondError(w, errdefs.Conflict("container name already in use", err))
+		case errors.Is(err, store.ErrNotFound), errors.Is(err, image.ErrNotFound):
+			respondError(w, errdefs.NotFound("no such image: "+req.Image, err))
+		default:
+			respondError(w, err)
+		}
 
 		return
 	}
@@ -68,7 +93,13 @@ func (h *Handlers) ContainerStart(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		if isNotFound(err) {
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
+
+			return
+		}
+
+		respondError(w, err)
 
 		return
 	}
@@ -79,22 +110,22 @@ func (h *Handlers) ContainerStart(w http.ResponseWriter, r *http.Request) {
 // ContainerStop handles POST /containers/{id}/stop.
 func (h *Handlers) ContainerStop(w http.ResponseWriter, r *http.Request) {
 	id := pathValue(r, "id")
-	timeout := runtime.DefaultStopTimeout
 
-	if t := r.URL.Query().Get("t"); t != "" {
-		if v, err := strconv.Atoi(t); err == nil {
-			timeout = v
-		}
+	timeout, err := validateTimeout(r.URL.Query().Get("t"), runtime.DefaultStopTimeout)
+	if err != nil {
+		respondError(w, err)
+
+		return
 	}
 
-	if err := h.runtime.Stop(r.Context(), id, timeout); err != nil {
-		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+	if stopErr := h.runtime.Stop(r.Context(), id, timeout); stopErr != nil {
+		if isNotFound(stopErr) {
+			respondError(w, errdefs.NotFound("no such container: "+id, stopErr))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, stopErr)
 
 		return
 	}
@@ -111,14 +142,26 @@ func (h *Handlers) ContainerKill(w http.ResponseWriter, r *http.Request) {
 		signal = runtime.DefaultKillSignal
 	}
 
+	if err := validateSignal(signal); err != nil {
+		respondError(w, err)
+
+		return
+	}
+
 	if err := h.runtime.Kill(r.Context(), id, signal); err != nil {
 		if errors.Is(err, runtime.ErrNotRunning) {
-			errorJSON(w, http.StatusConflict, err)
+			respondError(w, errdefs.Conflict("container is not running", err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		if isNotFound(err) {
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
+
+			return
+		}
+
+		respondError(w, err)
 
 		return
 	}
@@ -129,16 +172,22 @@ func (h *Handlers) ContainerKill(w http.ResponseWriter, r *http.Request) {
 // ContainerRestart handles POST /containers/{id}/restart.
 func (h *Handlers) ContainerRestart(w http.ResponseWriter, r *http.Request) {
 	id := pathValue(r, "id")
-	timeout := runtime.DefaultStopTimeout
 
-	if t := r.URL.Query().Get("t"); t != "" {
-		if v, err := strconv.Atoi(t); err == nil {
-			timeout = v
-		}
+	timeout, err := validateTimeout(r.URL.Query().Get("t"), runtime.DefaultStopTimeout)
+	if err != nil {
+		respondError(w, err)
+
+		return
 	}
 
-	if err := h.runtime.Restart(r.Context(), id, timeout); err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+	if restartErr := h.runtime.Restart(r.Context(), id, timeout); restartErr != nil {
+		if isNotFound(restartErr) {
+			respondError(w, errdefs.NotFound("no such container: "+id, restartErr))
+
+			return
+		}
+
+		respondError(w, restartErr)
 
 		return
 	}
@@ -156,12 +205,12 @@ func (h *Handlers) ContainerWait(w http.ResponseWriter, r *http.Request) {
 	// Verify container exists before committing to streaming response.
 	if _, err := h.runtime.Inspect(r.Context(), id); err != nil {
 		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -178,9 +227,15 @@ func (h *Handlers) ContainerWait(w http.ResponseWriter, r *http.Request) {
 	exitCode, err := h.runtime.Wait(r.Context(), id)
 	if err != nil {
 		// Can't change status code after headers are sent — write error in body.
+		// Use a generic message for non-errdefs errors to prevent leaking internals.
+		msg := errdefs.SafeMessage(err)
+		if errdefs.StatusCode(err) == http.StatusInternalServerError {
+			msg = "internal server error"
+		}
+
 		_ = json.NewEncoder(w).Encode(container.WaitResponse{
 			StatusCode: -1,
-			Error:      &container.WaitExitError{Message: err.Error()},
+			Error:      &container.WaitExitError{Message: msg},
 		})
 
 		return
@@ -198,18 +253,18 @@ func (h *Handlers) ContainerDelete(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.runtime.Remove(r.Context(), id, force); err != nil {
 		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
 			return
 		}
 
 		if errors.Is(err, runtime.ErrContainerRunning) {
-			errorJSON(w, http.StatusConflict, err)
+			respondError(w, errdefs.Conflict("container is running, use force to remove", err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -234,18 +289,22 @@ func (h *Handlers) ContainerList(w http.ResponseWriter, r *http.Request) {
 	// Parse Docker-style JSON filters.
 	if raw := q.Get("filters"); raw != "" {
 		var f map[string][]string
-		if err := json.Unmarshal([]byte(raw), &f); err == nil {
-			filters.ID = f["id"]
-			filters.Name = f["name"]
-			filters.Status = f["status"]
-			filters.Label = f["label"]
-			filters.Ancestor = f["ancestor"]
+		if err := json.Unmarshal([]byte(raw), &f); err != nil {
+			respondError(w, errdefs.InvalidParameter("invalid filters JSON", err))
+
+			return
 		}
+
+		filters.ID = f["id"]
+		filters.Name = f["name"]
+		filters.Status = f["status"]
+		filters.Label = f["label"]
+		filters.Ancestor = f["ancestor"]
 	}
 
 	records, err := h.runtime.List(r.Context(), &filters)
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -265,12 +324,12 @@ func (h *Handlers) ContainerInspect(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.runtime.Inspect(r.Context(), id)
 	if err != nil {
 		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -285,22 +344,28 @@ func (h *Handlers) ContainerLogs(w http.ResponseWriter, r *http.Request) {
 	record, err := h.runtime.Inspect(r.Context(), id)
 	if err != nil {
 		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
 
-	opts := parseLogOpts(r)
+	opts, err := parseLogOpts(r)
+	if err != nil {
+		respondError(w, err)
+
+		return
+	}
+
 	maxFiles := logMaxFiles(record)
 
 	reader, err := jsonfile.ReadLogsFrom(record.LogPath, maxFiles, opts)
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -320,7 +385,7 @@ func (h *Handlers) ContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func parseLogOpts(r *http.Request) clog.ReadOpts {
+func parseLogOpts(r *http.Request) (clog.ReadOpts, error) {
 	q := r.URL.Query()
 	opts := clog.ReadOpts{
 		Stdout: q.Get("stdout") != "false" && q.Get("stdout") != "0",
@@ -329,24 +394,36 @@ func parseLogOpts(r *http.Request) clog.ReadOpts {
 	}
 
 	if v := q.Get("tail"); v != "" && v != "all" {
-		if n, parseErr := strconv.Atoi(v); parseErr == nil {
-			opts.Tail = n
+		n, parseErr := strconv.Atoi(v)
+		if parseErr != nil {
+			return opts, fmt.Errorf("parse log opts: %w",
+				errdefs.InvalidParameter(fmt.Sprintf("invalid tail value: %q", v), parseErr))
 		}
+
+		opts.Tail = n
 	}
 
 	if v := q.Get("since"); v != "" {
-		if t, parseErr := parseSince(v); parseErr == nil {
-			opts.Since = t
+		t, parseErr := parseSince(v)
+		if parseErr != nil {
+			return opts, fmt.Errorf("parse log opts: %w",
+				errdefs.InvalidParameter(fmt.Sprintf("invalid since value: %q", v), parseErr))
 		}
+
+		opts.Since = t
 	}
 
 	if v := q.Get("until"); v != "" {
-		if t, parseErr := parseSince(v); parseErr == nil {
-			opts.Until = t
+		t, parseErr := parseSince(v)
+		if parseErr != nil {
+			return opts, fmt.Errorf("parse log opts: %w",
+				errdefs.InvalidParameter(fmt.Sprintf("invalid until value: %q", v), parseErr))
 		}
+
+		opts.Until = t
 	}
 
-	return opts
+	return opts, nil
 }
 
 func logMaxFiles(record *container.InspectResponse) int {
@@ -488,12 +565,12 @@ func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 	// Verify the container exists.
 	if _, err := h.runtime.Inspect(r.Context(), id); err != nil {
 		if isNotFound(err) {
-			errorJSON(w, http.StatusNotFound, err)
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -501,14 +578,14 @@ func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 	// Upgrade to raw stream (Docker CLI expects this).
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		errorJSON(w, http.StatusInternalServerError, ErrHijackUnsupported)
+		respondError(w, ErrHijackUnsupported)
 
 		return
 	}
 
 	conn, buf, err := hijacker.Hijack()
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, fmt.Errorf("hijack: %w", err))
+		respondError(w, fmt.Errorf("hijack: %w", err))
 
 		return
 	}

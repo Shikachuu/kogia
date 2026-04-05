@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
@@ -156,10 +157,20 @@ func writeProgress(pw *progressWriter, msg *progressMsg) {
 }
 
 // WriteError writes an error as an NDJSON progress message.
+// For errdefs errors the client-safe message is used. For plain errors a
+// generic message is sent to prevent leaking internal details.
 func WriteError(w io.Writer, flusher http.Flusher, err error) {
+	msg := errdefs.SafeMessage(err)
+
+	// If the error is not an errdefs type, it's an internal error —
+	// replace with a generic message (the caller already logged the real error).
+	if errdefs.StatusCode(err) == http.StatusInternalServerError {
+		msg = "internal server error"
+	}
+
 	pw := &progressWriter{w: w, flusher: flusher}
 	writeProgress(pw, &progressMsg{
-		ErrorDetail: &errorDetail{Message: err.Error()},
-		Error:       err.Error(),
+		ErrorDetail: &errorDetail{Message: msg},
+		Error:       msg,
 	})
 }

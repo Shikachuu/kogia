@@ -194,6 +194,11 @@ linters:
         linters:
           - all
 
+      - path: 'internal/api/errdefs/.*\.go'
+        linters:
+          - revive
+          - wrapcheck
+
       - path: '_test\.go'
         linters:
           - gocyclo

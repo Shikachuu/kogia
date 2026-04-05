@@ -28,6 +28,7 @@ description = "Run tests"
 run = "go test -tags containers_image_openpgp ./... -cover"
 
 [tasks.lint]
+env = { "GOOS" = "linux" }
 description = "Lint golang and protobuf code"
 run = ["golangci-lint run --config .golangci-lint.yml --fix"]
 
@@ -38,7 +39,10 @@ run = "hack/download-crun.sh"
 [tasks.build]
 description = "Build a local binaries"
 depends = ["download-crun"]
-run = "goreleaser build --clean --snapshot"
+run = """
+export DOCKER_API_VERSION=$(yq '.info.version' api/swagger.yaml)
+goreleaser build --clean --snapshot
+"""
 
 [tasks.dev]
 description = "Run kogia daemon locally for testing (state in bin/.kogia-dev/)"

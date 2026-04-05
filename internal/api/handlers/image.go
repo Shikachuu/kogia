@@ -2,28 +2,27 @@ package handlers
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/Shikachuu/kogia/internal/image"
 	imagetypes "github.com/moby/moby/api/types/image"
-)
-
-var (
-	errFromImageRequired = errors.New("fromImage is required")
-	errRepoRequired      = errors.New("repo is required")
-	errSearchTermRequired = errors.New("search term is required")
-	errNamesRequired      = errors.New("names query parameter is required")
 )
 
 // ImageCreate handles POST /images/create (pull).
 func (h *Handlers) ImageCreate(w http.ResponseWriter, r *http.Request) {
 	fromImage := r.URL.Query().Get("fromImage")
 	if fromImage == "" {
-		errorJSON(w, http.StatusBadRequest, errFromImageRequired)
+		respondError(w, errdefs.InvalidParameter("fromImage is required", nil))
+
+		return
+	}
+
+	if err := validateImageRef(fromImage); err != nil {
+		respondError(w, err)
 
 		return
 	}
@@ -48,7 +47,7 @@ func (h *Handlers) ImageCreate(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) ImageList(w http.ResponseWriter, _ *http.Request) {
 	images, err := h.images.List()
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -63,12 +62,12 @@ func (h *Handlers) ImageInspect(w http.ResponseWriter, r *http.Request) {
 	info, err := h.images.Get(name)
 	if err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			errorJSON(w, http.StatusNotFound, fmt.Errorf("no such image: %s: %w", name, err))
+			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -85,12 +84,12 @@ func (h *Handlers) ImageDelete(w http.ResponseWriter, r *http.Request) {
 	items, err := h.images.Remove(name, force, !noprune)
 	if err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			errorJSON(w, http.StatusNotFound, fmt.Errorf("no such image: %s: %w", name, err))
+			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -105,19 +104,25 @@ func (h *Handlers) ImageTag(w http.ResponseWriter, r *http.Request) {
 	tag := r.URL.Query().Get("tag")
 
 	if repo == "" {
-		errorJSON(w, http.StatusBadRequest, errRepoRequired)
+		respondError(w, errdefs.InvalidParameter("repo is required", nil))
+
+		return
+	}
+
+	if err := validateImageRef(repo); err != nil {
+		respondError(w, err)
 
 		return
 	}
 
 	if err := h.images.Tag(name, repo, tag); err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			errorJSON(w, http.StatusNotFound, fmt.Errorf("no such image: %s: %w", name, err))
+			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -132,12 +137,12 @@ func (h *Handlers) ImageHistory(w http.ResponseWriter, r *http.Request) {
 	history, err := h.images.History(name)
 	if err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			errorJSON(w, http.StatusNotFound, fmt.Errorf("no such image: %s: %w", name, err))
+			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
 			return
 		}
 
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -149,7 +154,7 @@ func (h *Handlers) ImageHistory(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) ImagePrune(w http.ResponseWriter, _ *http.Request) {
 	deleted, reclaimed, err := h.images.Prune()
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -164,7 +169,7 @@ func (h *Handlers) ImagePrune(w http.ResponseWriter, _ *http.Request) {
 func (h *Handlers) ImageSearch(w http.ResponseWriter, r *http.Request) {
 	term := r.URL.Query().Get("term")
 	if term == "" {
-		errorJSON(w, http.StatusBadRequest, errSearchTermRequired)
+		respondError(w, errdefs.InvalidParameter("search term is required", nil))
 
 		return
 	}
@@ -180,7 +185,7 @@ func (h *Handlers) ImageSearch(w http.ResponseWriter, r *http.Request) {
 
 	results, err := image.Search(r.Context(), term, limit)
 	if err != nil {
-		errorJSON(w, http.StatusInternalServerError, err)
+		respondError(w, err)
 
 		return
 	}
@@ -196,7 +201,7 @@ func (h *Handlers) ImageGet(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.images.Export([]string{name}, w); err != nil {
 		if errors.Is(err, image.ErrNotFound) {
-			errorJSON(w, http.StatusNotFound, fmt.Errorf("no such image: %s: %w", name, err))
+			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
 			return
 		}
@@ -209,7 +214,7 @@ func (h *Handlers) ImageGet(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) ImageGetAll(w http.ResponseWriter, r *http.Request) {
 	names := r.URL.Query()["names"]
 	if len(names) == 0 {
-		errorJSON(w, http.StatusBadRequest, errNamesRequired)
+		respondError(w, errdefs.InvalidParameter("names query parameter is required", nil))
 
 		return
 	}

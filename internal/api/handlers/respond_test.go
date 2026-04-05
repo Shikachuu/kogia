@@ -131,6 +131,20 @@ func TestErrorJSON(t *testing.T) {
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 		}
+
+		var got map[string]string
+
+		res := rec.Result()
+		defer res.Body.Close()
+
+		if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		// Must send generic message, never the real error.
+		if got["message"] != "internal server error" {
+			t.Errorf("message = %q, want %q", got["message"], "internal server error")
+		}
 	})
 
 	t.Run("400 bad request", func(t *testing.T) {
