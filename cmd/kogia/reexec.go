@@ -47,7 +47,9 @@ func fixReexecArgs() {
 
 	// storage-tar: called with [binary, src, root] and stdin is a pipe (JSON options).
 	// Shares the same arg count as untar but without extra fds.
-	if len(os.Args) == 3 && !fileDescriptorExists(3) {
+	// We also verify stdin is a pipe — when launched from a terminal (e.g.
+	// "kogia daemon --help"), stdin is a TTY and must not be treated as reexec.
+	if len(os.Args) == 3 && !fileDescriptorExists(3) && stdinIsPipe() {
 		os.Args[0] = "storage-tar"
 
 		return
@@ -59,4 +61,16 @@ func fileDescriptorExists(fd int) bool {
 	_, err := os.Stat(fmt.Sprintf("/proc/self/fd/%d", fd))
 
 	return err == nil
+}
+
+// stdinIsPipe returns true if stdin is a pipe or regular file (not a terminal).
+// Used to distinguish real storage-tar reexec (stdin is a pipe carrying JSON
+// options) from normal CLI invocations where stdin is a TTY.
+func stdinIsPipe() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+
+	return fi.Mode()&os.ModeCharDevice == 0
 }

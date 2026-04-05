@@ -23,7 +23,7 @@ description = "Runs trivy security checks (vulnerability, secret leaks, miss-con
 run = "trivy fs . --scanners vuln,secret"
 
 [tasks.test]
-env = { "CGO_ENABLED" = "0" }
+env = { "CGO_ENABLED" = "0", "GOOS" = "linux" }
 description = "Run tests"
 run = "go test -tags containers_image_openpgp ./... -cover"
 
@@ -54,16 +54,17 @@ case "$ARCH" in
   aarch64|arm64) GOARCH=arm64 ;;
   *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
-BINARY="bin/kogia-linux-${GOARCH}"
+BINARY="dist/bin/kogia-linux-${GOARCH}"
 if [ ! -f "$BINARY" ]; then
   echo "error: $BINARY not found (did 'mise run build' succeed?)" >&2
   exit 1
 fi
-mkdir -p bin/.kogia-dev/run
-exec "$BINARY" daemon \
-  --root bin/.kogia-dev/data \
-  --socket bin/.kogia-dev/run/kogia.sock \
-  --log-level debug
+mkdir -p dist/bin/.kogia-dev/run
+sudo "$BINARY" daemon \
+  --root /tmp/kogia/data \
+  --socket /tmp/kogia/run/kogia.sock \
+  --log-level debug \
+  --storage-driver vfs
 """
 
 [tasks.release-snapshot]

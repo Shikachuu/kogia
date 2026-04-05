@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -66,22 +68,41 @@ func (m *Manager) reapChildren() {
 			exitCode = 128 + int(ws.Signal())
 		}
 
-		oomKilled := isOOMKilled(pid)
+		var oomKilled bool
+
+		m.mu.Lock()
+		id, ok := m.pidMap[pid]
+		m.mu.Unlock()
+
+		if ok && len(id) >= 12 {
+			oomKilled = isOOMKilled("/sys/fs/cgroup/kogia/" + id[:12])
+		}
 
 		slog.Debug("reaped child process", "pid", pid, "exitCode", exitCode, "oomKilled", oomKilled)
 		m.HandleExit(pid, exitCode, oomKilled)
 	}
 }
 
-// isOOMKilled checks if a process was OOM killed by reading cgroup memory events.
-// This is best-effort — if we can't determine, we return false.
-func isOOMKilled(pid int) bool {
-	// For cgroup v2, check /proc/{pid}/cgroup to find the cgroup path,
-	// then check memory.events for "oom_kill" count.
-	// Since the process has already exited, we can't read /proc/{pid}.
-	// The cgroup may still exist briefly. This is best-effort.
-	// TODO: implement proper OOM detection via cgroup memory events.
-	_ = pid
+// isOOMKilled checks whether a container was OOM-killed by reading its
+// cgroup v2 memory.events file. The cgroup directory may still exist
+// briefly after the process exits. This is best-effort — if the file
+// is already gone or unparseable, we return false.
+func isOOMKilled(cgroupPath string) bool {
+	data, err := os.ReadFile(cgroupPath + "/memory.events") //nolint:gosec // path is constructed from trusted cgroup prefix + container ID.
+	if err != nil {
+		return false
+	}
+
+	for line := range strings.SplitSeq(string(data), "\n") {
+		key, value, ok := strings.Cut(line, " ")
+		if !ok || key != "oom_kill" {
+			continue
+		}
+
+		count, parseErr := strconv.Atoi(value)
+
+		return parseErr == nil && count > 0
+	}
 
 	return false
 }
