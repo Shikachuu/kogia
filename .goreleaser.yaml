@@ -5,9 +5,11 @@ project_name: kogia
 
 builds:
   - id: kogia
-    main: ./cmd/kogia/main.go
+    main: ./cmd/kogia
     binary: bin/{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}
     no_unique_dist_dir: true
+    tags:
+      - containers_image_openpgp
     env:
       - CGO_ENABLED=0
     flags:
@@ -25,7 +27,7 @@ builds:
       - -X main.dockerAPIVersion={{ .Env.DOCKER_API_VERSION }}
 
   - id: kogia-cni
-    main: ./cmd/kogia-cni/main.go
+    main: ./cmd/kogia-cni
     binary: bin/{{ .ProjectName }}-cni-{{ .Os }}-{{ .Arch }}
     no_unique_dist_dir: true
     env:
