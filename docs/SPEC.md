@@ -30,7 +30,6 @@ Official Docker CLI / docker compose / docker buildx
 │  │ state DB     │  │ container DNS│  │
 │  └──────────────┘  └──────────────┘  │
 │  moby stdcopy (streaming helpers)    │
-│  [buildkitd — on-demand subprocess]  │
 └──────────────────────────────────────┘
           │ fork/exec crun
           ▼
@@ -52,7 +51,7 @@ Official Docker CLI / docker compose / docker buildx
 | State | bbolt (go.etcd.io/bbolt) | Pure Go, no CGo, proven (etcd/Kubernetes). Single-writer but sufficient. |
 | Networking | vishvananda/netlink + google/nftables + miekg/dns (in-process) | Custom CNI-compatible. internal/network/ code + thin cmd/kogia-cni binary |
 | DNS | miekg/dns authoritative server on bridge gateway IP | Dynamic updates as containers join/leave. resolv.conf points containers here |
-| BuildKit | On-demand subprocess | Start buildkitd when builds requested, stop after idle. Uses kogia's socket as Docker backend. |
+| BuildKit | docker-container buildx driver | Builds use `docker buildx` with the docker-container driver, which manages its own buildkitd container. No in-daemon build subprocess. |
 | Container supervision | In-daemon goroutine per container | waitpid on crun process, collect exit code, manage stdio, update bbolt |
 | Live-restore | Deferred to v2 | Daemon shutdown stops all containers. Simpler v1. |
 | Interface | Docker API only (Unix socket) | No MCP. `DOCKER_HOST=unix:///run/kogia.sock` |
@@ -121,7 +120,7 @@ kogia/
 │   │       ├── image.go             # pull, list, inspect, remove, tag
 │   │       ├── network.go           # create, remove, connect, disconnect, inspect, list
 │   │       ├── volume.go            # create, remove, inspect, list, prune
-│   │       ├── build.go             # /build endpoint → buildkitd proxy
+│   │       ├── build.go             # /build, /build/prune, /session stubs (→ use docker-container driver)
 │   │       └── system.go            # _ping, version, info, events
 │   ├── runtime/
 │   │   ├── crun.go                  # crun exec helper (--root, error handling)
@@ -148,9 +147,6 @@ kogia/
 │   │   └── volume.go                # volume CRUD
 │   ├── volume/
 │   │   └── manager.go               # named volumes at /var/lib/kogia/volumes/
-│   ├── build/
-│   │   ├── manager.go               # buildkitd lifecycle (start/stop/idle timeout)
-│   │   └── proxy.go                 # /build + /grpc session proxy to buildkitd
 │   ├── metrics/
 │   │   └── metrics.go               # Prometheus metrics definitions + go-swagger middleware
 │   └── events/
@@ -222,15 +218,13 @@ github.com/go-openapi/loads           # used by hack/gen-routes to parse swagger
 │   ├── overlay/              # layer data
 │   ├── overlay-images/       # image metadata
 │   └── overlay-layers/       # layer metadata
-├── volumes/{name}/_data/
-└── buildkit/buildkitd        # extracted buildkitd binary
+└── volumes/{name}/_data/
 
 /run/kogia/
 ├── kogia.sock                # API socket
 ├── kogia.pid
 ├── crun/                     # crun state directory
-├── image/                    # containers/storage runroot
-└── buildkit.sock             # buildkit socket (when running)
+└── image/                    # containers/storage runroot
 ```
 
 ---
@@ -348,17 +342,34 @@ docker image prune               # remove dangling images
 
 ---
 
-### Phase 2: Container Run
+### Phase 2: Container Run ✅
 **Goal:** `docker run --rm hello-world` prints output and exits.
 
-**Create:**
-- `internal/runtime/crun.go` — exec helper: `crun --root /run/kogia/crun/ <command> <args>`, captures stdout/stderr, wraps errors
-- `internal/runtime/spec.go` — Docker Config → OCI spec. Start minimal (args, env, cwd, root, default namespaces, default mounts: /proc, /dev, /dev/pts, /dev/shm, /sys). Expand iteratively.
-- `internal/runtime/container.go` — **Create:** generate ID (64 hex), generate name, resolve image via containers/storage, `store.CreateContainer()` for RW layer, write OCI spec to bundle dir, persist in bbolt. **Start:** `store.Mount()` → update spec root → set up stdio pipes → `crun create --bundle=... --pid-file=...` → `crun start` → launch supervision goroutine. **Stop:** `crun kill SIGTERM` → timeout → `crun kill SIGKILL`. **Remove:** stop if force, `crun delete`, `store.Unmount()`, `store.DeleteContainer()`, rm bundle dir, remove from bbolt.
-- `internal/runtime/io.go` — for non-TTY: `os.Pipe()` pairs for stdout/stderr as `exec.Cmd.Stdout/Stderr`. Write to jsonfilelog format. Multiplex via stdcopy for attach/logs endpoints.
-- `internal/runtime/wait.go` — one goroutine per running container, `cmd.Wait()` or direct `unix.Wait4` on container PID, collect exit code, update bbolt, close pipes, signal waiters via channel, handle auto-remove.
-- `internal/store/container.go` — bbolt CRUD, name→ID index bucket, list with status/name/label/ancestor filters
-- `internal/api/handlers/container.go` — `POST /containers/create`, `POST /containers/{id}/start`, `POST /containers/{id}/stop`, `POST /containers/{id}/kill`, `POST /containers/{id}/restart`, `POST /containers/{id}/wait`, `DELETE /containers/{id}`, `GET /containers/json` (with filters), `GET /containers/{id}/json`, `GET /containers/{id}/logs` (with `follow`, `stdout`, `stderr`, `since`, `tail`)
+**Implemented:**
+- `internal/runtime/crun.go` — `CrunConfig` struct (BinaryPath + RootDir). `run()` generic command executor appends `--root` flag, captures stderr. `createWithIO()` runs `crun create --bundle --pid-file` passing stdout/stderr `*os.File` directly (not wrappers) to avoid internal pipe + goroutine leak. `start()`, `kill()` (with `--signal`), `deleteContainer()` (with `--force`). All commands have 30s timeout.
+- `internal/runtime/spec.go` — `GenerateSpec()` produces OCI 1.2.0 spec from Docker config. Merges entrypoint + cmd per Docker precedence rules. Builds environment (image + container config), ensures PATH and HOSTNAME. User/group resolution via `/etc/passwd` and `/etc/group` in rootfs (`parseUser()`, `lookupUser()`, `lookupGroup()` — supports all Docker formats: uid, uid:gid, username, username:group). Sets default Linux capabilities (42 caps) or all for privileged. Resource limits (memory, CPU, PIDs). Default mounts: /proc, /dev, /dev/pts, /dev/shm, /dev/mqueue, /sys, /sys/fs/cgroup. Namespaces: PID, mount, IPC, UTS (no network yet — Phase 4). Cgroup path: `kogia/{hostname}`. Exported `BuildArgs()` helper for entrypoint + cmd merging.
+- `internal/runtime/container.go` — `Manager` struct with `active` map (tracks running containers), `pidMap` (container PID → ID), bundleRoot, store, images, crun references. **Create:** 32 random bytes → 64-char hex ID. Auto-generated Docker-style names ("adjective_scientist##") via `names.go`, or user-provided with `/` prefix. Resolves image, creates RW layer via containers/storage, mounts rootfs, generates OCI spec, writes config.json to bundle dir, persists `InspectResponse` to bbolt. **Start:** Mounts rootfs, updates spec root path, creates jsonfile log driver, creates stdio pipes, starts copy goroutines *before* `crun create` (deadlock prevention), reads PID from pid-file, registers in `active`+`pidMap` *before* `crun start` (race prevention for instant-exit containers), updates bbolt state to "running", calls `crun start`. **Stop:** Sets `manuallyStopped` flag (prevents restart policy from firing), sends SIGTERM with timeout, waits on `ac.done` channel, sends SIGKILL if timeout, cleans up crun state. **Kill:** Sends arbitrary signal. **Remove:** Stops if force, `crun delete`, unmounts rootfs, deletes storage container, removes bundle dir, removes from bbolt. **Restart:** Stop → Start. **Wait:** Handles "created" state by polling until active entry appears, blocks on `ac.done` channel, returns stored exit code. **Inspect/List:** Read from bbolt. **HandleExit:** Called by reaper — closes stdio/log driver, updates bbolt to exited, handles auto-remove and restart policies (exponential backoff: 100ms base, 2x multiplier, 1 min cap). **RecoverOrphans:** On startup, marks "running"/"restarting" containers as exited (exit code 137), cleans up "created" containers entirely. **Shutdown:** Gracefully stops all containers (10s timeout).
+- `internal/runtime/io.go` — `containerIO` struct with stdout/stderr pipe pairs. `newContainerIO()` creates `os.Pipe()` pairs. `startCopyLoop()` launches 2 goroutines reading pipes → writing to jsonfile log driver (buffered scanner, 64KB buffer, 1MB max line, each line timestamped). `WriterFds()` returns write FDs for crun. `MarkWritersClosed()` records that Start() closed write-ends after crun inherits them. `Close()` closes read-ends, waits for copy goroutines, closes log driver. `writersClosed` flag guards against double-close.
+- `internal/runtime/wait.go` — `SetSubreaper()` sets `PR_SET_CHILD_SUBREAPER` on daemon so orphaned container processes reparent to daemon. `StartReaper()` goroutine handles SIGCHLD via `signal.Notify`, calls `reapChildren()` on each signal. `reapChildren()` loops `unix.Wait4` to collect all exited children, extracts exit code (Exited vs Signaled paths), detects OOM kills by reading `/sys/fs/cgroup/kogia/{id[:12]}/memory.events`, calls `HandleExit()` for each matched PID.
+- `internal/runtime/defaults.go` — Constants: `DefaultStopTimeout=10s`, `DefaultStopSignal=SIGTERM`, `DefaultKillSignal=SIGKILL`, `RestartBackoffBase=100ms`, `RestartBackoffMultiplier=2`, `RestartBackoffMax=1min`, `WaitPollInterval=100ms`, `CrunOperationTimeout=30s`, `DefaultPathEnv`, `ContainerIDBytes=32`.
+- `internal/runtime/names.go` — `generateName()` returns Docker-style "adjective_scientist##" names (e.g., "jolly_curie42"). Falls back to `container_{random_hex}` after 10 failed attempts.
+- `internal/store/container.go` — Three bbolt buckets: `containers` (ID → JSON InspectResponse), `container_names` (name → ID), `container_bundles` (ID → bundle path). `CreateContainer()` checks name uniqueness. `GetContainer()` resolves by full ID, name, or ID prefix (cursor-based, detects ambiguous prefixes). `UpdateContainer()`, `DeleteContainer()` (removes from all buckets). `ContainerNameExists()`. `SetContainerBundle()`/`GetContainerBundle()`. `ContainerFilters` struct supports Docker-style filtering by ID, Name, Status, Label, Ancestor, with Limit and All controls. `ListContainers()` applies all filters.
+- `internal/api/handlers/container.go` — All Phase 2 endpoints implemented:
+  - `ContainerCreate` (POST /containers/create) — validates name/config/host config, calls runtime.Create(), returns ID + warnings
+  - `ContainerStart` (POST /containers/{id}/start) — returns 204 on success, 304 if already running
+  - `ContainerStop` (POST /containers/{id}/stop) — parses timeout query param
+  - `ContainerKill` (POST /containers/{id}/kill) — parses and validates signal name
+  - `ContainerRestart` (POST /containers/{id}/restart) — parses timeout
+  - `ContainerWait` (POST /containers/{id}/wait) — flushes 200 OK immediately, blocks until exit, writes JSON body when done
+  - `ContainerDelete` (DELETE /containers/{id}) — parses force param
+  - `ContainerList` (GET /containers/json) — parses filters JSON, converts to Summary format
+  - `ContainerInspect` (GET /containers/{id}/json) — returns full InspectResponse
+  - `ContainerLogs` (GET /containers/{id}/logs) — streams in Docker stdcopy format (8-byte header: stream_type + 3 padding + 4-byte BE size + payload), flushes after each frame
+  - `ContainerAttach` (POST /containers/{id}/attach) — minimal stub: hijacks connection, sends upgrade headers, closes immediately (full implementation in Phase 3)
+  - Validation helpers: `validateContainerName()`, `validateContainerConfig()`, `validateHostConfig()`, `validateTimeout()`, `validateSignal()`
+  - Error mapping: ErrNotFound→404, ErrNameInUse→409, ErrAlreadyRunning→304, ErrNotRunning→409, ErrContainerRunning→409
+- `internal/api/handlers/respond.go` — `respondError()` maps errors to HTTP status codes via errdefs package. 500 errors don't leak messages (always "internal server error").
+- `internal/daemon/daemon.go` — Startup sequence extended: extract embedded crun binary, set subreaper, create `runtime.Manager` (crun binary path, crun root dir, bundle root, store + images), call `RecoverOrphans()`, start reaper goroutine. Shutdown: graceful server shutdown (5s timeout), graceful container shutdown (10s timeout).
 
 **Verify:**
 ```bash
@@ -463,17 +474,32 @@ docker compose down -v
 
 ---
 
-### Phase 6: Build
-**Goal:** `docker build .` works via on-demand BuildKit subprocess.
+### Phase 6: Build + Remaining Image Endpoints ✅
+**Goal:** `docker buildx build` works via docker-container driver. All image endpoints implemented.
 
-**Create:**
-- `internal/build/manager.go` — start `buildkitd --addr unix:///run/kogia/buildkit.sock --oci-worker-binary=crun --containerd-worker=false` on first build request. Set `DOCKER_HOST=unix:///run/kogia.sock` so BuildKit uses kogia as backend. Idle timeout (5 min) → SIGTERM → stop. Track PID.
-- `internal/build/proxy.go` — proxy `/build`, `/session`, `/grpc` endpoints to buildkitd. Docker CLI uses BuildKit gRPC over HTTP upgrade; kogia upgrades the connection and proxies to buildkitd's gRPC socket.
+**Architecture:** Modern Docker CLI (v28+) routes all builds through buildx. The docker-container driver creates and manages its own buildkitd container — no in-daemon build subprocess needed. This requires working container lifecycle (pull, create, start, exec) from earlier phases.
+
+**Implemented:**
+- `internal/api/handlers/build.go` — `ImageBuild`, `BuildPrune`, `Session` stubs return clear message directing users to the docker-container buildx driver.
+- `internal/api/handlers/commit.go` — `ImageCommit` (`POST /commit`): full implementation. Creates new image from container's RW layer with config overrides (Cmd, Entrypoint, Env, ExposedPorts, Volumes, WorkingDir, Labels, User). Uses containers/storage `Container()` → `Layer()` → `CreateImage()` + manifest/config big data.
+- `internal/image/commit.go` — `Store.Commit()`: clones base OCI config, applies overrides, appends new layer DiffID, creates image with manifest + config stored as big data.
+- `internal/api/handlers/distribution.go` — `DistributionInspect` (`GET /distribution/{name}/json`): queries registry for manifest metadata without pulling. Supports auth via existing `ResolveAuth` infrastructure.
+- `internal/image/inspect_remote.go` — `Store.DistributionInspect()`: uses containers/image to fetch manifest from registry, parses manifest lists for platform info.
 
 **Verify:**
 ```bash
-echo 'FROM alpine\nRUN echo hi > /x\nCMD cat /x' | docker build -t test -
+# Build (requires working container lifecycle for docker-container driver)
+docker buildx create --driver docker-container --name kogia --use
+echo 'FROM alpine\nRUN echo hi > /x\nCMD cat /x' | docker buildx build -t test --load -
 docker run --rm test  # "hi"
+
+# Commit
+docker run -d --name myc alpine sleep 3600
+docker commit myc myimage:v1
+docker run --rm myimage:v1 cat /world.txt
+
+# Distribution inspect
+docker manifest inspect alpine
 ```
 
 ---
@@ -484,8 +510,7 @@ docker run --rm test  # "hi"
 SIGTERM/SIGINT received →
   1. Stop accepting connections (close Unix socket listener)
   2. Drain in-flight API requests (5s timeout)
-  3. Stop buildkitd if running
-  4. For each running container (parallel):
+  3. For each running container (parallel):
      a. crun kill {id} SIGTERM
      b. Wait up to 10s
      c. crun kill {id} SIGKILL if still running

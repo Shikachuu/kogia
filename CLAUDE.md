@@ -37,7 +37,6 @@ docker CLI → REST/JSON over Unix socket → kogia daemon → crun (fork/exec) 
 | `internal/network/` | Bridge networking (netlink), NAT (nftables), DNS (miekg/dns), IPAM, CNI |
 | `internal/store/` | bbolt state persistence |
 | `internal/volume/` | Named volume management |
-| `internal/build/` | On-demand buildkitd subprocess + proxy |
 | `internal/events/` | Event fan-out bus (container/image/network/volume lifecycle) |
 | `internal/metrics/` | Opt-in Prometheus metrics |
 | `cmd/kogia/` | CLI entry point (cobra) |
@@ -51,6 +50,7 @@ docker CLI → REST/JSON over Unix socket → kogia daemon → crun (fork/exec) 
 - **Image stack:** containers/image + containers/storage — Podman-grade, handles all registry/layer/overlayfs complexity
 - **State:** bbolt — pure Go, single-writer, no CGo
 - **Networking:** in-process netlink + nftables + miekg/dns — no external CNI daemon
+- **Error handling:** errdefs + SafeError pattern — see [`docs/error-handling.md`](docs/error-handling.md)
 - **Logging:** `log/slog` (stdlib structured JSON)
 - **No CGo:** entire codebase builds with `CGO_ENABLED=0`
 
