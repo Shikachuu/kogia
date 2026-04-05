@@ -12,13 +12,16 @@ import (
 
 	"github.com/Shikachuu/kogia/internal/api"
 	"github.com/Shikachuu/kogia/internal/api/handlers"
+	"github.com/Shikachuu/kogia/internal/image"
 	"github.com/Shikachuu/kogia/internal/store"
 )
 
 // Config holds daemon startup configuration.
+// All fields are expected to be pre-validated by the CLI layer.
 type Config struct {
 	SocketPath       string
 	RootDir          string
+	StorageDriver    image.StorageDriver
 	DockerAPIVersion string
 	Version          string
 	Commit           string
@@ -58,7 +61,22 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}()
 
-	h := handlers.New(s, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
+	images, err := image.NewStore(image.StoreOptions{
+		GraphRoot: filepath.Join(cfg.RootDir, "image"),
+		RunRoot:   filepath.Join(socketDir, "image"),
+		Driver:    cfg.StorageDriver,
+	})
+	if err != nil {
+		return fmt.Errorf("daemon: open image store: %w", err)
+	}
+
+	defer func() {
+		if cerr := images.Close(); cerr != nil {
+			slog.Error("failed to close image store", "err", cerr)
+		}
+	}()
+
+	h := handlers.New(s, images, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
 	srv := api.New(cfg.SocketPath, cfg.DockerAPIVersion, h)
 
 	if err = srv.Start(); err != nil {

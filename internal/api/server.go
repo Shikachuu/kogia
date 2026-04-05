@@ -107,6 +107,7 @@ func withMiddleware(next http.Handler, basePath string) http.Handler {
 		}()
 
 		rewriteVersionPrefix(r, basePath)
+		encodeSlashyPathParams(r, basePath)
 
 		next.ServeHTTP(rw, r)
 	})
@@ -131,6 +132,72 @@ func rewriteVersionPrefix(r *http.Request, basePath string) {
 	}
 }
 
+// slashyPrefixes are API path prefixes where the {name} parameter can contain
+// slashes (e.g. "docker.io/library/alpine"). Go's ServeMux {name} only matches
+// one path segment, so we URL-encode the slashes in the name before dispatch,
+// then PathValue("name") returns the decoded value automatically.
+//
+// Pattern: /<prefix>/<name-with-slashes>[/<suffix>]
+// The known suffixes for each prefix are listed so we can identify where the
+// name ends and the suffix begins.
+var slashyRoutes = []struct {
+	prefix   string
+	suffixes []string
+}{
+	{"/images/", []string{"/json", "/history", "/push", "/tag", "/get"}},
+	{"/plugins/", []string{"/json", "/enable", "/disable", "/push", "/set", "/upgrade"}},
+	{"/distribution/", []string{"/json"}},
+}
+
+// encodeSlashyPathParams rewrites request paths so that image/plugin names
+// containing slashes are URL-encoded into a single path segment for ServeMux
+// matching. For example:
+//
+//	/v1.54/images/docker.io/library/alpine/json
+//	→ /v1.54/images/docker.io%2Flibrary%2Falpine/json
+func encodeSlashyPathParams(r *http.Request, basePath string) {
+	path := r.URL.Path
+
+	for _, route := range slashyRoutes {
+		fullPrefix := basePath + route.prefix
+		if !strings.HasPrefix(path, fullPrefix) {
+			continue
+		}
+
+		rest := path[len(fullPrefix):]
+		if rest == "" {
+			continue
+		}
+
+		// Try to find a known suffix at the end of the remaining path.
+		var name, suffix string
+
+		for _, s := range route.suffixes {
+			if strings.HasSuffix(rest, s) {
+				name = rest[:len(rest)-len(s)]
+				suffix = s
+
+				break
+			}
+		}
+
+		if name == "" {
+			// No suffix matched — the entire rest is the name (e.g. DELETE /images/{name}).
+			name = rest
+		}
+
+		// Only rewrite if the name actually contains slashes.
+		if !strings.Contains(name, "/") {
+			return
+		}
+
+		encoded := strings.ReplaceAll(name, "/", "%2F")
+		r.URL.Path = fullPrefix + encoded + suffix
+
+		return
+	}
+}
+
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -139,4 +206,13 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Flush delegates to the underlying ResponseWriter if it supports flushing.
+// This is required for streaming endpoints (pull, push, load, events) to send
+// NDJSON progress lines incrementally instead of buffering the entire response.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

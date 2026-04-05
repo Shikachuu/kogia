@@ -296,21 +296,54 @@ docker version && docker info && docker ps
 
 ---
 
-### Phase 1: Image Pull
-**Goal:** `docker pull alpine` works. `docker images` lists it.
+### Phase 1: Image Management ✅
+**Goal:** Full image lifecycle — pull, list, inspect, tag, remove, history, prune, search, save/load, push.
 
-**Create:**
-- `internal/image/store.go` — init containers/storage (`StoreOptions{GraphRoot, RunRoot, GraphDriverName: "overlay"}`), translate storage.Image ↔ Docker types.ImageSummary/ImageInspect
-- `internal/image/pull.go` — `docker.Transport.ParseReference()` → `storage.Transport.ParseStoreReference()` → `copy.Image()`. Stream NDJSON progress (`{"status":"Pulling...","progressDetail":{}}`)
-- `internal/image/auth.go` — parse `~/.docker/config.json`, extract credentials, pass as `types.DockerAuthConfig`
-- `internal/api/handlers/image.go` — `POST /images/create` (pull with progress stream), `GET /images/json` (list), `GET /images/{name}/json` (inspect), `DELETE /images/{name}` (remove), `POST /images/{name}/tag`
+**Implemented:**
+- `internal/image/store.go` — containers/storage wrapper. Configurable driver via `StorageDriver` type (overlay, vfs, fuse-overlayfs). `List()`, `Get()`, `Remove()`, `Tag()`, `History()`, `Prune()`. OCI config parsing for inspect (architecture, rootfs, labels, config). Image name resolution with normalization (`alpine` → `docker.io/library/alpine:latest`).
+- `internal/image/pull.go` — `copy.Image()` from docker transport → storage transport. NDJSON progress streaming via `progressWriter` (wraps `containers/image` text into `{"status":"..."}` lines, flushes via `http.Flusher`). In-band error reporting for streaming responses.
+- `internal/image/push.go` — Push from local storage to docker registry. Auth support, NDJSON progress streaming. Resolves name+tag for images where CLI sends them separately.
+- `internal/image/export.go` — Export one or more images as Docker archive tar via `docker/archive.Writer`. Used by `docker save`.
+- `internal/image/load.go` — Import images from Docker archive tar via `docker/archive.Reader`. NDJSON progress streaming. Used by `docker load`.
+- `internal/image/search.go` — Docker Hub registry search via HTTP API. Supports `term` and `limit` params.
+- `internal/image/auth.go` — `X-Registry-Auth` header decoding (base64 JSON) + `~/.docker/config.json` parsing (inline auth field). Priority: header → config.json → anonymous.
+- `internal/api/handlers/image.go` — All image handlers except `ImageCommit` (requires running containers, Phase 2):
+  - `ImageCreate` (POST /images/create) — pull with NDJSON progress
+  - `ImageList` (GET /images/json) — list all images
+  - `ImageInspect` (GET /images/{name}/json) — full inspect with OCI config
+  - `ImageDelete` (DELETE /images/{name}) — remove/untag
+  - `ImageTag` (POST /images/{name}/tag) — add tag
+  - `ImageHistory` (GET /images/{name}/history) — layer history from OCI config
+  - `ImagePrune` (POST /images/prune) — remove dangling images
+  - `ImageSearch` (GET /images/search) — Docker Hub search
+  - `ImageGet` (GET /images/{name}/get) — export single image as tar
+  - `ImageGetAll` (GET /images/get) — export multiple images as tar
+  - `ImageLoad` (POST /images/load) — import from tar
+  - `ImagePush` (POST /images/{name}/push) — push to registry
+- `internal/api/handlers/respond.go` — `respondJSON[T]`, `errorJSON`, `pathValue` (URL-decodes path params after slashy-path middleware encoding)
+- `internal/api/server.go` — `encodeSlashyPathParams` middleware: URL-encodes slashes in image/plugin/distribution names so `{name}` in ServeMux matches multi-segment references (e.g., `docker.io/library/alpine`). `responseWriter.Flush()` delegation for streaming endpoints.
+- `internal/daemon/daemon.go` — Image store initialization at startup (GraphRoot from `--root`, RunRoot from socket dir parent). Configurable `--storage-driver` flag.
+- `cmd/kogia/main.go` — `PreRunE` validates all CLI params (log level, storage driver, paths resolved to absolute). `--storage-driver` flag (overlay/vfs/fuse-overlayfs).
+- `cmd/kogia/reexec.go` — Handles `containers/storage` subprocess re-execution for chroot layer operations. Detects reexec invocations via environmental signals (OPT env var, fd probing) and patches `os.Args[0]` before `reexec.Init()` — works around Go 1.26+ behavior where `os.Args[0]` resolves to binary path instead of handler name.
+- `.goreleaser.yaml` — Updated `main` to package path (not single file) for multi-file builds. Build tag `containers_image_openpgp` for CGO_ENABLED=0 compatibility.
+- `.golangci-lint.yml` — Added `containers_image_openpgp` build tag.
+- `mise.toml` — Added `containers_image_openpgp` build tag to build/test tasks.
+
+**Dependencies added:** `containers/image/v5`, `containers/storage`
 
 **Verify:**
 ```bash
 docker pull hello-world && docker pull alpine:latest
 docker images                    # lists both
 docker image inspect alpine      # full JSON
+docker image history alpine      # layer history
+docker image tag alpine myalpine:v1
+docker rmi myalpine:v1
 docker rmi hello-world && docker images  # only alpine
+docker save alpine -o /tmp/alpine.tar && docker rmi alpine
+docker load -i /tmp/alpine.tar && docker images  # alpine restored
+docker search nginx              # Docker Hub search
+docker image prune               # remove dangling images
 ```
 
 ---
