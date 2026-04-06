@@ -52,7 +52,7 @@ Official Docker CLI / docker compose / docker buildx
 | Networking | vishvananda/netlink + google/nftables + miekg/dns (in-process) | Custom CNI-compatible. internal/network/ code + thin cmd/kogia-cni binary |
 | DNS | miekg/dns authoritative server on bridge gateway IP | Dynamic updates as containers join/leave. resolv.conf points containers here |
 | BuildKit | docker-container buildx driver | Builds use `docker buildx` with the docker-container driver, which manages its own buildkitd container. No in-daemon build subprocess. |
-| Container supervision | In-daemon goroutine per container | Subreaper + SIGCHLD reaper collects exit codes, manages stdio, updates bbolt. Exit codes persisted to `exitcode` file for crash recovery. OOM detected via cgroup v2 `memory.events` with dynamically resolved cgroup path. Daemon protected from OOM killer (`oom_score_adj=-1000`). |
+| Container supervision | In-daemon goroutine per container | Subreaper + SIGCHLD reaper collects exit codes, manages stdio, updates bbolt. Exit codes persisted to `exitcode` file for crash recovery. Live OOM detection via inotify watch on cgroup v2 `memory.events` (with post-mortem fallback). Dynamically resolved cgroup path. Daemon protected from OOM killer (`oom_score_adj=-1000`). |
 | Live-restore | Deferred to v2 | Daemon shutdown stops all containers. Simpler v1. |
 | Interface | Docker API only (Unix socket) | No MCP. `DOCKER_HOST=unix:///run/kogia.sock` |
 | CGo | Not required | bbolt is pure Go. containers/storage overlay driver uses pure Go. crun is external binary. |
@@ -115,20 +115,25 @@ kogia/
 │   │   ├── server.go                # net/http server setup, middleware, Unix socket listener
 │   │   └── handlers/
 │   │       ├── respond.go           # generic respondJSON[T] helper
-│   │       ├── container.go         # container CRUD, logs, attach, resize, wait
-│   │       ├── exec.go              # exec create/start/inspect
+│   │       ├── container.go         # container CRUD, logs, attach, resize, pause, unpause, top, wait
+│   │       ├── exec.go              # exec create/start/inspect/resize
 │   │       ├── image.go             # pull, list, inspect, remove, tag
 │   │       ├── network.go           # create, remove, connect, disconnect, inspect, list
 │   │       ├── volume.go            # create, remove, inspect, list, prune
 │   │       ├── build.go             # /build, /build/prune, /session stubs (→ use docker-container driver)
 │   │       └── system.go            # _ping, version, info, events
 │   ├── runtime/
-│   │   ├── crun.go                  # crun exec helper (--root, error handling)
-│   │   ├── container.go             # create, start, stop, kill, remove lifecycle
-│   │   ├── exec.go                  # exec via crun exec
-│   │   ├── spec.go                  # Docker Config → OCI runtime spec (~600-800 LOC, highest risk)
-│   │   ├── io.go                    # PTY (console-socket), pipes, stdcopy multiplexing
-│   │   └── wait.go                  # supervision goroutine, exit code collection
+│   │   ├── crun.go                  # crun exec helper (--root, create, start, kill, pause, exec)
+│   │   ├── container.go             # create, start, stop, kill, remove, attach, resize, pause, unpause, top
+│   │   ├── console.go               # PTY master fd via console-socket (SCM_RIGHTS), terminal resize
+│   │   ├── exec.go                  # exec sessions (create, start, inspect, resize, cleanup)
+│   │   ├── spec.go                  # Docker Config → OCI runtime spec
+│   │   ├── io.go                    # containerIO: pipes, PTY, stdin, attach fan-out with early buffering
+│   │   ├── oom.go                   # live OOM detection via inotify on cgroup v2 memory.events
+│   │   ├── top.go                   # container process listing from cgroup.procs + /proc
+│   │   ├── wait.go                  # subreaper, SIGCHLD reaper, exit code persistence
+│   │   ├── names.go                 # Docker-style container name generation
+│   │   └── defaults.go              # timeout, signal, backoff constants
 │   ├── image/
 │   │   ├── pull.go                  # containers/image pull + NDJSON progress streaming
 │   │   ├── store.go                 # containers/storage wrapper, Docker types translation
@@ -142,7 +147,7 @@ kogia/
 │   │   └── cni.go                   # CNI protocol handler (ADD/DEL/CHECK/VERSION)
 │   ├── store/
 │   │   ├── db.go                    # bbolt setup, bucket structure, generic helpers
-│   │   ├── container.go             # container state CRUD + name index
+│   │   ├── container.go             # container state CRUD + name index (resolves ID, name, /name, ID prefix)
 │   │   ├── network.go               # network/endpoint CRUD
 │   │   └── volume.go                # volume CRUD
 │   ├── volume/
@@ -355,7 +360,7 @@ docker image prune               # remove dangling images
 - `internal/runtime/wait.go` — `SetSubreaper()` sets `PR_SET_CHILD_SUBREAPER` on daemon so orphaned container processes reparent to daemon. `StartReaper()` goroutine handles SIGCHLD via `signal.Notify`, calls `reapChildren()` on each signal. `reapChildren()` loops `unix.Wait4` to collect all exited children, extracts exit code (Exited vs Signaled paths), writes persistent `exitcode` file (exit code + OOM status) to bundle dir before calling `HandleExit()`, detects OOM kills via dynamically resolved cgroup v2 path (`resolveCgroupPath()` reads `/proc/{pid}/cgroup`). `readExitCodeFile()`/`writeExitCodeFile()` helpers for crash recovery.
 - `internal/runtime/defaults.go` — Constants: `DefaultStopTimeout=10s`, `DefaultStopSignal=SIGTERM`, `DefaultKillSignal=SIGKILL`, `RestartBackoffBase=100ms`, `RestartBackoffMultiplier=2`, `RestartBackoffMax=1min`, `WaitPollInterval=100ms`, `CrunOperationTimeout=30s`, `DefaultPathEnv`, `ContainerIDBytes=32`.
 - `internal/runtime/names.go` — `generateName()` returns Docker-style "adjective_scientist##" names (e.g., "jolly_curie42"). Falls back to `container_{random_hex}` after 10 failed attempts.
-- `internal/store/container.go` — Three bbolt buckets: `containers` (ID → JSON InspectResponse), `container_names` (name → ID), `container_bundles` (ID → bundle path). `CreateContainer()` checks name uniqueness. `GetContainer()` resolves by full ID, name, or ID prefix (cursor-based, detects ambiguous prefixes). `UpdateContainer()`, `DeleteContainer()` (removes from all buckets). `ContainerNameExists()`. `SetContainerBundle()`/`GetContainerBundle()`. `ContainerFilters` struct supports Docker-style filtering by ID, Name, Status, Label, Ancestor, with Limit and All controls. `ListContainers()` applies all filters.
+- `internal/store/container.go` — Three bbolt buckets: `containers` (ID → JSON InspectResponse), `container_names` (name → ID), `container_bundles` (ID → bundle path). `CreateContainer()` checks name uniqueness. `GetContainer()` resolves by full ID, name (with or without `/` prefix — Docker stores names as `/foo` but CLI sends `foo`), or ID prefix (cursor-based, detects ambiguous prefixes). `UpdateContainer()`, `DeleteContainer()` (removes from all buckets). `ContainerNameExists()`. `SetContainerBundle()`/`GetContainerBundle()`. `ContainerFilters` struct supports Docker-style filtering by ID, Name, Status, Label, Ancestor, with Limit and All controls. `ListContainers()` applies all filters.
 - `internal/api/handlers/container.go` — All Phase 2 endpoints implemented:
   - `ContainerCreate` (POST /containers/create) — validates name/config/host config, calls runtime.Create(), returns ID + warnings
   - `ContainerStart` (POST /containers/{id}/start) — returns 204 on success, 304 if already running
@@ -385,23 +390,38 @@ docker run --rm alpine cat /etc/os-release
 
 ---
 
-### Phase 3: Interactive + Exec
-**Goal:** `docker run -it alpine sh` and `docker exec` work.
+### Phase 3: Interactive + Exec + Live OOM ✅
+**Goal:** `docker run -it alpine sh`, `docker exec`, pause/unpause/top, and live OOM detection work.
 
-**Modify:**
-- `internal/runtime/io.go` — add TTY support: `crun create --console-socket=...`, receive PTY master fd via SCM_RIGHTS (`unix.Recvmsg`), bidirectional proxy between HTTP connection and PTY fd. Window resize via `unix.IoctlSetWinsize`.
-- `internal/runtime/exec.go` — `crun exec --process=process.json {containerID}`. For TTY exec: same console-socket flow. For non-TTY: pipe stdin/stdout/stderr.
-- `internal/api/handlers/container.go` — add `POST /containers/{id}/attach` (HTTP hijack via `w.(http.Hijacker).Hijack()`, then raw bidirectional stream; stdcopy framing for non-TTY, raw for TTY), `POST /containers/{id}/resize`, `POST /containers/{id}/pause` (`crun pause`), `POST /containers/{id}/unpause` (`crun resume`), `GET /containers/{id}/top`
-- `internal/api/handlers/exec.go` — `POST /containers/{id}/exec` (create), `POST /exec/{id}/start` (HTTP hijack + crun exec), `GET /exec/{id}/json`
+**Implemented:**
+- `internal/runtime/io.go` — `containerIO` extended to support three modes: non-TTY (stdout/stderr pipes), non-TTY with stdin (+ stdin pipe), and TTY (PTY master fd). Attach fan-out: registered `io.Writer`s receive container output in real time. Early output buffering for TTY mode — `copyStreamRaw` buffers output in `attachBuf` before the first attach writer registers, `AddAttachWriter` replays the buffer on connect (prevents losing the initial shell prompt). `WriteStdin()` writes to PTY master (TTY) or stdin pipe (non-TTY). `CloseStdin()` delivers EOF. `ResizePTY()` calls `TIOCSWINSZ` via `unix.IoctlSetWinsize`. Two copy modes: `copyStream` (line-buffered, for non-TTY — feeds log driver + attach writers) and `copyStreamRaw` (chunk-based, for TTY — raw bytes to attach writers for instant interactive echo, lines accumulated separately for log driver).
+- `internal/runtime/console.go` — `ReceivePTYMaster()`: listens on a Unix socket, accepts one connection, receives PTY master fd via SCM_RIGHTS using `conn.ReadMsgUnix` + `unix.ParseUnixRights`. Used by both container start and exec start for TTY mode. `resizePTY()`: sets terminal window size via `unix.IoctlSetWinsize`.
+- `internal/runtime/crun.go` — `createWithConsole()`: `crun create --console-socket=<path>` for TTY containers. `createWithIO()` extended with optional stdin `*os.File` parameter. `execCmd()`: returns unstarted `*exec.Cmd` for `crun exec --process=<file> <id>`. `execWithConsole()`: same with `--console-socket`. `pause()`/`resume()`: thin wrappers around `crun pause`/`crun resume`.
+- `internal/runtime/spec.go` — `Terminal` field now dynamic: `opts.Config != nil && opts.Config.Tty` (was hardcoded `false`).
+- `internal/runtime/container.go` — `Start()` branches on `Config.Tty` and `Config.OpenStdin`: TTY path creates console-socket, starts listener goroutine, calls `createWithConsole`, receives PTY master, sets it on containerIO, starts raw copy loop; non-TTY path passes optional stdin fd to `createWithIO`. Stop-when-paused: `Stop()` calls `crun resume` before `killAll` if container is paused. New methods: `Attach()` (polls for active entry, registers attach writer, forwards stdin in goroutine, blocks until container exit or client disconnect), `Resize()` (delegates to `containerIO.ResizePTY`), `Pause()`/`Unpause()` (validates state, calls crun, updates bbolt), `Top()` (reads from cgroup.procs + /proc).
+- `internal/runtime/exec.go` — `ExecSession` struct (ID, ContainerID, Config, Running, ExitCode, Pid, ptyMaster). In-memory `execSessions` map on Manager (ephemeral, matches Docker behavior). `ExecCreate()`: validates container is running, generates 64-char hex ID, stores session. `ExecStart()`: builds OCI process.json from session config (inherits container's env, capabilities, user; overlays exec-specific env/cwd/tty), runs `crun exec` with TTY (console-socket) or pipe-based stdio, streams I/O over hijacked connection, collects exit code. `ExecInspect()`: returns session state. `ExecResize()`: calls `resizePTY` on session's PTY master. `cleanupExecSessions()`: marks all sessions for a container as exited when the container exits (called from `HandleExit`).
+- `internal/runtime/top.go` — `readContainerProcesses()`: reads PIDs from `cgroup.procs`, then reads `/proc/{pid}/stat`, `/proc/{pid}/status` (UID), `/proc/{pid}/cmdline` for each. Returns `container.TopResponse` with standard ps column headers.
+- `internal/runtime/oom.go` — `startOOMWatch()`: creates inotify watch on `<cgroupPath>/memory.events` via `unix.InotifyInit1` + `unix.InotifyAddWatch(IN_MODIFY)`. Goroutine reads events, checks `oom_kill` counter, updates bbolt state on detection. Returns cancel function that closes the inotify fd. Integrated into `Start()` (after cgroup path resolution) and `HandleExit()` (cancel before closing IO). Existing post-mortem `isOOMKilled` check in `reapChildren()` kept as fallback.
+- `internal/api/handlers/container.go` — `ContainerAttach`: hijacks connection with `101 UPGRADED` + upgrade headers (Docker CLI requires 101, not 200), uses `context.Background()` for the blocking Attach call (request context is cancelled after hijack). Non-streaming path (docker run -d) closes immediately. `ContainerResize`: parses h/w query params, delegates to `Manager.Resize()`. `ContainerPause`/`ContainerUnpause`/`ContainerTop`: standard handler pattern with error mapping.
+- `internal/api/handlers/exec.go` — `ContainerExec` (POST /containers/{id}/exec): decodes `ExecCreateRequest`, validates Cmd not empty, calls `ExecCreate`, responds with `ExecCreateResponse{ID}`. `ExecStart` (POST /exec/{id}/start): decodes `ExecStartRequest`, detached mode starts in background goroutine, interactive mode hijacks connection with 101 + upgrade headers, calls `ExecStart` with `context.Background()`. `ExecInspect` (GET /exec/{id}/json): returns `ExecInspectResponse`. `ExecResize` (POST /exec/{id}/resize): parses h/w, delegates to `ExecResize`.
 
 **Verify:**
 ```bash
 docker run -it --rm alpine sh            # interactive shell, exit
+docker run -i --rm alpine cat            # pipe stdin, Ctrl+D to EOF
 docker run -d --name test alpine sleep 3600
+docker attach test                       # see output, Ctrl+C to detach
 docker exec test ls /
 docker exec -it test sh                  # interactive exec
 docker exec -e FOO=bar test env
+docker pause test && docker ps           # shows "paused"
+docker unpause test && docker ps         # shows "running"
+docker top test
 docker stop test && docker rm test
+# OOM detection
+docker run -d --name oom --memory=10m alpine sh -c 'x=""; while true; do x="$x$(head -c 1m /dev/urandom)"; done'
+docker inspect oom --format '{{.State.OOMKilled}}'  # true
+docker rm -f oom
 ```
 
 ---
