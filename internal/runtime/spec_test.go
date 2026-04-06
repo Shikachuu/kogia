@@ -1284,6 +1284,56 @@ func assertMountDests(t *testing.T, mounts []ocispec.Mount, dests []string) {
 	assertStringSlice(t, "mount destinations", got, want)
 }
 
+func TestGenerateSpec_TTY(t *testing.T) {
+	t.Parallel()
+
+	rootfs := setupFakeRootfs(t)
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config: &container.Config{
+			Image: "alpine",
+			Cmd:   []string{"sh"},
+			Tty:   true,
+		},
+		HostConfig: &container.HostConfig{},
+		RootPath:   rootfs,
+		Hostname:   "test12345678",
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !spec.Process.Terminal {
+		t.Error("terminal should be true when Config.Tty=true")
+	}
+}
+
+func TestGenerateSpec_NoTTY_Explicit(t *testing.T) {
+	t.Parallel()
+
+	rootfs := setupFakeRootfs(t)
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config: &container.Config{
+			Image: "alpine",
+			Cmd:   []string{"echo", "hi"},
+			Tty:   false,
+		},
+		HostConfig: &container.HostConfig{},
+		RootPath:   rootfs,
+		Hostname:   "test12345678",
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if spec.Process.Terminal {
+		t.Error("terminal should be false when Config.Tty=false")
+	}
+}
+
 func envToMap(env []string) map[string]string {
 	m := make(map[string]string)
 

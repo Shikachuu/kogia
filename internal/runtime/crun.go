@@ -46,7 +46,16 @@ func (c *CrunConfig) run(ctx context.Context, args ...string) error {
 // If cmd.Stdout/Stderr is a non-File io.Writer, Go creates an internal pipe +
 // copy goroutine. The double-forked container inherits the internal pipe FD,
 // and cmd.Wait() blocks forever waiting for EOF that never comes.
-func (c *CrunConfig) createWithIO(ctx context.Context, id, bundleDir, pidFile string, stdout, stderr *os.File) error {
+// createWithIO runs `crun create` passing the container's stdio pipes as
+// inherited FDs. The double-forked container process inherits these FDs,
+// so it can write to our pipes even after crun itself exits.
+//
+// IMPORTANT: stdin, stdout, and stderr MUST be *os.File (not io.Writer wrappers).
+// If cmd.Stdout/Stderr is a non-File io.Writer, Go creates an internal pipe +
+// copy goroutine. The double-forked container inherits the internal pipe FD,
+// and cmd.Wait() blocks forever waiting for EOF that never comes.
+// stdin may be nil if the container does not accept input.
+func (c *CrunConfig) createWithIO(ctx context.Context, id, bundleDir, pidFile string, stdin, stdout, stderr *os.File) error {
 	fullArgs := []string{
 		"--root", c.RootDir,
 		"create",
@@ -62,8 +71,11 @@ func (c *CrunConfig) createWithIO(ctx context.Context, id, bundleDir, pidFile st
 
 	// Pass *os.File directly — Go passes the FD to the child without creating
 	// internal pipes. The container process (double-forked by crun) inherits
-	// these FDs. crun's own error messages also go to stderr (mixed with
-	// container stderr), but we detect crun failures via exit code.
+	// these FDs.
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -72,6 +84,64 @@ func (c *CrunConfig) createWithIO(ctx context.Context, id, bundleDir, pidFile st
 	}
 
 	return nil
+}
+
+// createWithConsole runs `crun create` with --console-socket for TTY containers.
+// crun connects to the console socket and sends the PTY master fd via SCM_RIGHTS.
+// No stdout/stderr pipes are needed — the container's stdio goes through the PTY.
+func (c *CrunConfig) createWithConsole(ctx context.Context, id, bundleDir, pidFile, consoleSock string) error {
+	fullArgs := []string{
+		"--root", c.RootDir,
+		"create",
+		"--bundle", bundleDir,
+		"--pid-file", pidFile,
+		"--console-socket", consoleSock,
+		"--no-new-keyring",
+		id,
+	}
+
+	slog.Debug("crun exec", "args", fullArgs)
+
+	cmd := exec.CommandContext(ctx, c.BinaryPath, fullArgs...) //nolint:gosec // BinaryPath is the embedded crun binary, not user input.
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("crun create (console): %w: %s", err, stderr.String())
+	}
+
+	return nil
+}
+
+// execCmd returns an unstarted *exec.Cmd for `crun exec --process=<file> <id>`.
+// The caller manages stdio assignment and lifecycle (Start/Wait).
+func (c *CrunConfig) execCmd(ctx context.Context, id, processFile string) *exec.Cmd {
+	fullArgs := []string{
+		"--root", c.RootDir,
+		"exec",
+		"--process", processFile,
+		id,
+	}
+
+	slog.Debug("crun exec cmd", "args", fullArgs)
+
+	return exec.CommandContext(ctx, c.BinaryPath, fullArgs...) //nolint:gosec // BinaryPath is the embedded crun binary, not user input.
+}
+
+// execWithConsole returns an unstarted *exec.Cmd for `crun exec` with --console-socket.
+func (c *CrunConfig) execWithConsole(ctx context.Context, id, processFile, consoleSock string) *exec.Cmd {
+	fullArgs := []string{
+		"--root", c.RootDir,
+		"exec",
+		"--process", processFile,
+		"--console-socket", consoleSock,
+		id,
+	}
+
+	slog.Debug("crun exec cmd (console)", "args", fullArgs)
+
+	return exec.CommandContext(ctx, c.BinaryPath, fullArgs...) //nolint:gosec // BinaryPath is the embedded crun binary, not user input.
 }
 
 // start runs `crun start` to begin execution of the container's process.
@@ -93,4 +163,14 @@ func (c *CrunConfig) killAll(ctx context.Context, id, signal string) error {
 // deleteContainer runs `crun delete --force` to clean up container state.
 func (c *CrunConfig) deleteContainer(ctx context.Context, id string) error {
 	return c.run(ctx, "delete", "--force", id)
+}
+
+// pause freezes all processes in the container.
+func (c *CrunConfig) pause(ctx context.Context, id string) error {
+	return c.run(ctx, "pause", id)
+}
+
+// resume unfreezes a paused container.
+func (c *CrunConfig) resume(ctx context.Context, id string) error {
+	return c.run(ctx, "resume", id)
 }

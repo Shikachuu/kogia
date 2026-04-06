@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -556,14 +557,11 @@ func parseSince(s string) (time.Time, error) {
 }
 
 // ContainerAttach handles POST /containers/{id}/attach.
-// Full interactive attach is Phase 3. This minimal implementation supports
-// the Docker CLI's `docker run -d` flow, which sends an attach request before
-// starting the container. We upgrade to raw stream and immediately close it.
 func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 	id := pathValue(r, "id")
 
-	// Verify the container exists.
-	if _, err := h.runtime.Inspect(r.Context(), id); err != nil {
+	record, err := h.runtime.Inspect(r.Context(), id)
+	if err != nil {
 		if isNotFound(err) {
 			respondError(w, errdefs.NotFound("no such container: "+id, err))
 
@@ -575,7 +573,13 @@ func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upgrade to raw stream (Docker CLI expects this).
+	q := r.URL.Query()
+	wantStream := q.Get("stream") == "1" || q.Get("stream") == queryValueTrue
+	wantStdin := q.Get("stdin") == "1" || q.Get("stdin") == queryValueTrue
+	wantStdout := q.Get("stdout") == "1" || q.Get("stdout") == queryValueTrue
+	wantStderr := q.Get("stderr") == "1" || q.Get("stderr") == queryValueTrue
+
+	// Upgrade to raw stream.
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		respondError(w, ErrHijackUnsupported)
@@ -590,14 +594,128 @@ func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send the HTTP 200 + upgrade headers that Docker CLI expects.
-	_, _ = buf.WriteString("HTTP/1.1 200 OK\r\n")
+	// Send 101 Switching Protocols — Docker CLI requires this for upgrade.
+	_, _ = buf.WriteString("HTTP/1.1 101 UPGRADED\r\n")
 	_, _ = buf.WriteString("Content-Type: application/vnd.docker.raw-stream\r\n")
 	_, _ = buf.WriteString("Connection: Upgrade\r\n")
 	_, _ = buf.WriteString("Upgrade: tcp\r\n")
 	_, _ = buf.WriteString("\r\n")
 	_ = buf.Flush()
 
-	// Close immediately — the container will run detached.
+	if !wantStream {
+		// Non-streaming attach (docker run -d flow): close immediately.
+		_ = conn.Close()
+
+		return
+	}
+
+	isTTY := record.Config != nil && record.Config.Tty
+
+	// Use a detached context — r.Context() is cancelled after hijack since
+	// Go's HTTP server considers the request done once the connection is taken.
+	_ = h.runtime.Attach(context.Background(), record.ID, &runtime.AttachOpts{
+		Conn:   conn,
+		Stdin:  wantStdin,
+		Stdout: wantStdout,
+		Stderr: wantStderr,
+		TTY:    isTTY,
+	})
+
 	_ = conn.Close()
+}
+
+// ContainerResize handles POST /containers/{id}/resize.
+func (h *Handlers) ContainerResize(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	height, err := strconv.Atoi(r.URL.Query().Get("h"))
+	if err != nil {
+		respondError(w, errdefs.InvalidParameter("invalid height", err))
+
+		return
+	}
+
+	width, err := strconv.Atoi(r.URL.Query().Get("w"))
+	if err != nil {
+		respondError(w, errdefs.InvalidParameter("invalid width", err))
+
+		return
+	}
+
+	if resizeErr := h.runtime.Resize(r.Context(), id, uint16(height), uint16(width)); resizeErr != nil {
+		if isNotFound(resizeErr) {
+			respondError(w, errdefs.NotFound("no such container: "+id, resizeErr))
+
+			return
+		}
+
+		respondError(w, resizeErr)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// ContainerPause handles POST /containers/{id}/pause.
+func (h *Handlers) ContainerPause(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	if err := h.runtime.Pause(r.Context(), id); err != nil {
+		if isNotFound(err) {
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
+
+			return
+		}
+
+		respondError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerUnpause handles POST /containers/{id}/unpause.
+func (h *Handlers) ContainerUnpause(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	if err := h.runtime.Unpause(r.Context(), id); err != nil {
+		if isNotFound(err) {
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
+
+			return
+		}
+
+		respondError(w, err)
+
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContainerTop handles GET /containers/{id}/top.
+func (h *Handlers) ContainerTop(w http.ResponseWriter, r *http.Request) {
+	id := pathValue(r, "id")
+
+	psArgs := r.URL.Query().Get("ps_args")
+	if psArgs == "" {
+		psArgs = "-ef"
+	}
+
+	resp, err := h.runtime.Top(r.Context(), id, psArgs)
+	if err != nil {
+		if isNotFound(err) {
+			respondError(w, errdefs.NotFound("no such container: "+id, err))
+
+			return
+		}
+
+		respondError(w, err)
+
+		return
+	}
+
+	respondJSON(w, http.StatusOK, resp)
 }

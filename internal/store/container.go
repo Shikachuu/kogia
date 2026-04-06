@@ -68,15 +68,20 @@ func (s *Store) GetContainer(idOrName string) (*container.InspectResponse, error
 			return nil
 		}
 
-		// Try name→ID lookup.
+		// Try name→ID lookup. Names are stored with "/" prefix (Docker convention)
+		// but CLI sends them without the prefix.
 		names := tx.Bucket([]byte(bucketContNames))
-		if id := names.Get([]byte(idOrName)); id != nil {
-			v := containers.Get(id)
-			if v != nil {
-				data = make([]byte, len(v))
-				copy(data, v)
 
-				return nil
+		nameVariants := []string{idOrName, "/" + idOrName}
+		for _, name := range nameVariants {
+			if id := names.Get([]byte(name)); id != nil {
+				v := containers.Get(id)
+				if v != nil {
+					data = make([]byte, len(v))
+					copy(data, v)
+
+					return nil
+				}
 			}
 		}
 

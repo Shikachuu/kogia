@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -36,19 +37,22 @@ var (
 
 // Manager manages container lifecycle via crun.
 type Manager struct {
-	crun       *CrunConfig
-	store      *store.Store
-	images     *image.Store
-	active     map[string]*activeContainer
-	pidMap     map[int]string
-	bundleRoot string
-	mu         sync.Mutex
+	crun         *CrunConfig
+	store        *store.Store
+	images       *image.Store
+	active       map[string]*activeContainer
+	pidMap       map[int]string
+	execSessions map[string]*ExecSession
+	bundleRoot   string
+	mu           sync.Mutex
+	execMu       sync.Mutex
 }
 
 // activeContainer tracks a running container's ephemeral state.
 type activeContainer struct {
 	done            chan struct{}
 	io              *containerIO
+	cancelOOM       func() // stops OOM inotify watcher; nil if not started
 	id              string
 	bundleDir       string
 	cgroupPath      string
@@ -72,11 +76,12 @@ func NewManager(cfg ManagerConfig) *Manager {
 			BinaryPath: cfg.CrunBinary,
 			RootDir:    cfg.CrunRoot,
 		},
-		store:      cfg.Store,
-		images:     cfg.Images,
-		bundleRoot: cfg.BundleRoot,
-		active:     make(map[string]*activeContainer),
-		pidMap:     make(map[int]string),
+		store:        cfg.Store,
+		images:       cfg.Images,
+		bundleRoot:   cfg.BundleRoot,
+		active:       make(map[string]*activeContainer),
+		pidMap:       make(map[int]string),
+		execSessions: make(map[string]*ExecSession),
 	}
 }
 
@@ -329,7 +334,7 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 	}
 
 	if record.State.Status == container.StateRunning {
-		return fmt.Errorf("runtime: %w: %s", ErrAlreadyRunning, id[:12])
+		return fmt.Errorf("runtime: %w: %s", ErrAlreadyRunning, record.ID[:12])
 	}
 
 	bundleDir, err := m.store.GetContainerBundle(record.ID)
@@ -361,52 +366,101 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 		return fmt.Errorf("runtime: create log driver: %w", err)
 	}
 
-	// Create stdio pipes.
-	cio, err := newContainerIO(logDriver)
+	// Determine stdio mode from container config.
+	wantTTY := record.Config != nil && record.Config.Tty
+	wantStdin := record.Config != nil && record.Config.OpenStdin
+
+	cio, err := newContainerIO(logDriver, wantTTY, wantStdin)
 	if err != nil {
 		_ = logDriver.Close()
 
 		return fmt.Errorf("runtime: create stdio: %w", err)
 	}
 
-	// Start copy goroutines BEFORE crun create. This ensures the pipe read-ends
-	// are being drained, preventing deadlock if crun or the container writes to
-	// stdout/stderr during creation.
-	//
 	// GOROUTINE LEAK GUARD: Every error path after this point MUST call
-	// cio.Close() to close the write-end pipes, allowing the copy goroutines
-	// to receive EOF and exit. Without this, the goroutines block forever on
-	// read. No standard Go linter detects goroutine leaks statically; use
-	// goleak (go.uber.org/goleak) in tests to catch them at runtime.
-	cio.startCopyLoop()
+	// cio.Close() to close the write-end pipes / PTY, allowing the copy
+	// goroutines to receive EOF and exit.
 
-	// crun create — pass container stdout/stderr pipe write-ends so the
-	// double-forked container process inherits them.
 	pidFile := filepath.Join(bundleDir, "container.pid")
-	stdoutW, stderrW := cio.WriterFds()
 
-	slog.Debug("crun create starting", "id", record.ID[:12], "bundle", bundleDir, "root", rootPath)
+	slog.Debug("crun create starting", "id", record.ID[:12], "bundle", bundleDir, "root", rootPath, "tty", wantTTY)
 
 	createCtx, createCancel := context.WithTimeout(ctx, CrunOperationTimeout)
 	defer createCancel()
 
-	if createErr := m.crun.createWithIO(createCtx, record.ID, bundleDir, pidFile, stdoutW, stderrW); createErr != nil {
-		slog.Error("crun create failed", "id", record.ID[:12], "err", createErr)
+	if wantTTY {
+		// TTY path: use console-socket to receive PTY master fd.
+		consoleSock := filepath.Join(bundleDir, "console.sock")
 
-		cio.Close()
+		// Start listener goroutine BEFORE crun create — crun connects to it.
+		type ptyResult struct {
+			file *os.File
+			err  error
+		}
 
-		return fmt.Errorf("runtime: crun create: %w", createErr)
+		ptyCh := make(chan ptyResult, 1)
+
+		go func() {
+			pty, ptyErr := ReceivePTYMaster(consoleSock, CrunOperationTimeout)
+			ptyCh <- ptyResult{pty, ptyErr}
+		}()
+
+		if createErr := m.crun.createWithConsole(createCtx, record.ID, bundleDir, pidFile, consoleSock); createErr != nil {
+			slog.Error("crun create failed", "id", record.ID[:12], "err", createErr)
+
+			cio.Close()
+
+			return fmt.Errorf("runtime: crun create: %w", createErr)
+		}
+
+		// Wait for the PTY master fd from the console-socket listener.
+		result := <-ptyCh
+		if result.err != nil {
+			_ = m.crun.deleteContainer(ctx, record.ID)
+
+			cio.Close()
+
+			return fmt.Errorf("runtime: receive pty master: %w", result.err)
+		}
+
+		cio.SetPTYMaster(result.file)
+		cio.startCopyLoop()
+	} else {
+		// Non-TTY path: start copy goroutines BEFORE crun create to prevent
+		// deadlock if crun or the container writes during creation.
+		cio.startCopyLoop()
+
+		stdoutW, stderrW := cio.WriterFds()
+		stdinR := cio.StdinFd() // nil if stdin not requested
+
+		if createErr := m.crun.createWithIO(createCtx, record.ID, bundleDir, pidFile, stdinR, stdoutW, stderrW); createErr != nil {
+			slog.Error("crun create failed", "id", record.ID[:12], "err", createErr)
+
+			cio.Close()
+
+			return fmt.Errorf("runtime: crun create: %w", createErr)
+		}
+
+		slog.Debug("crun create succeeded", "id", record.ID[:12])
+
+		// Close our copy of the write-ends. The container process (double-forked
+		// by crun) holds its own references. If we don't close these, our read
+		// goroutines will never get EOF because the write-end refcount stays > 0.
+		if stdoutW != nil {
+			_ = stdoutW.Close()
+		}
+
+		if stderrW != nil {
+			_ = stderrW.Close()
+		}
+
+		// Close our copy of the stdin read-end; the container has its own ref.
+		if stdinR != nil {
+			_ = stdinR.Close()
+		}
+
+		cio.MarkWritersClosed()
 	}
-
-	slog.Debug("crun create succeeded", "id", record.ID[:12])
-
-	// Close our copy of the write-ends. The container process (double-forked
-	// by crun) holds its own references. If we don't close these, our read
-	// goroutines will never get EOF because the write-end refcount stays > 0.
-	_ = stdoutW.Close()
-	_ = stderrW.Close()
-
-	cio.MarkWritersClosed()
 
 	// Read PID from pid-file. crun create writes this (it's the container
 	// init PID), so it's available before crun start.
@@ -439,9 +493,13 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 		bundleDir:  bundleDir,
 		cgroupPath: cgPath,
 	}
+
 	m.active[record.ID] = ac
 	m.pidMap[pid] = record.ID
 	m.mu.Unlock()
+
+	// Start live OOM monitoring via inotify.
+	ac.cancelOOM = m.startOOMWatch(record.ID, cgPath)
 
 	// Update state in bbolt.
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -490,12 +548,22 @@ func (m *Manager) Stop(ctx context.Context, id string, timeout int) error {
 		return fmt.Errorf("runtime: %w", err)
 	}
 
-	if !record.State.Running {
+	if !record.State.Running && !record.State.Paused {
 		return nil // Already stopped.
 	}
 
 	if timeout <= 0 {
 		timeout = DefaultStopTimeout
+	}
+
+	// Unpause before stopping — crun kill doesn't work on frozen cgroups.
+	if record.State.Paused {
+		resumeCtx, resumeCancel := context.WithTimeout(ctx, CrunOperationTimeout)
+		defer resumeCancel()
+
+		if resumeErr := m.crun.resume(resumeCtx, record.ID); resumeErr != nil {
+			slog.Debug("resume before stop failed", "id", record.ID[:12], "err", resumeErr)
+		}
 	}
 
 	// Mark as manually stopped so unless-stopped policy doesn't restart.
@@ -577,7 +645,7 @@ func (m *Manager) Remove(ctx context.Context, id string, force bool) error {
 
 	if record.State.Running {
 		if !force {
-			return fmt.Errorf("runtime: %w: %s", ErrContainerRunning, id[:12])
+			return fmt.Errorf("runtime: %w: %s", ErrContainerRunning, record.ID[:12])
 		}
 
 		if stopErr := m.Stop(ctx, record.ID, DefaultStopTimeout); stopErr != nil {
@@ -698,6 +766,88 @@ func (m *Manager) List(_ context.Context, filters *store.ContainerFilters) ([]*c
 	return results, nil
 }
 
+// Pause freezes all processes in the container.
+func (m *Manager) Pause(ctx context.Context, id string) error {
+	record, err := m.store.GetContainer(id)
+	if err != nil {
+		return fmt.Errorf("runtime: %w", err)
+	}
+
+	if record.State.Status != container.StateRunning {
+		return fmt.Errorf("runtime: %w: %s", ErrNotRunning, record.ID[:12])
+	}
+
+	if record.State.Paused {
+		return fmt.Errorf("runtime: container is already paused: %s", record.ID[:12])
+	}
+
+	pauseCtx, cancel := context.WithTimeout(ctx, CrunOperationTimeout)
+	defer cancel()
+
+	if err := m.crun.pause(pauseCtx, record.ID); err != nil {
+		return fmt.Errorf("runtime: pause: %w", err)
+	}
+
+	record.State.Status = container.StatePaused
+	record.State.Paused = true
+
+	if updateErr := m.store.UpdateContainer(record); updateErr != nil {
+		slog.Error("failed to update paused state", "id", record.ID[:12], "err", updateErr)
+	}
+
+	return nil
+}
+
+// Unpause unfreezes a paused container.
+func (m *Manager) Unpause(ctx context.Context, id string) error {
+	record, err := m.store.GetContainer(id)
+	if err != nil {
+		return fmt.Errorf("runtime: %w", err)
+	}
+
+	if !record.State.Paused {
+		return fmt.Errorf("runtime: container is not paused: %s", record.ID[:12])
+	}
+
+	resumeCtx, cancel := context.WithTimeout(ctx, CrunOperationTimeout)
+	defer cancel()
+
+	if err := m.crun.resume(resumeCtx, record.ID); err != nil {
+		return fmt.Errorf("runtime: unpause: %w", err)
+	}
+
+	record.State.Status = container.StateRunning
+	record.State.Paused = false
+
+	if updateErr := m.store.UpdateContainer(record); updateErr != nil {
+		slog.Error("failed to update unpaused state", "id", record.ID[:12], "err", updateErr)
+	}
+
+	return nil
+}
+
+// Top lists processes running in the container.
+func (m *Manager) Top(ctx context.Context, id, psArgs string) (*container.TopResponse, error) {
+	record, err := m.store.GetContainer(id)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: %w", err)
+	}
+
+	if record.State.Status != container.StateRunning && record.State.Status != container.StatePaused {
+		return nil, fmt.Errorf("runtime: %w: %s", ErrNotRunning, record.ID[:12])
+	}
+
+	m.mu.Lock()
+	ac := m.active[record.ID]
+	m.mu.Unlock()
+
+	if ac == nil {
+		return nil, fmt.Errorf("runtime: %w: %s", ErrNotRunning, record.ID[:12])
+	}
+
+	return readContainerProcesses(ac.cgroupPath)
+}
+
 // HandleExit is called by the reaper when a child process exits.
 func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 	m.mu.Lock()
@@ -715,6 +865,14 @@ func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 	m.mu.Unlock()
 
 	slog.Info("container exited", "id", containerID[:12], "pid", pid, "exitCode", exitCode)
+
+	// Clean up exec sessions for this container.
+	m.cleanupExecSessions(containerID)
+
+	// Stop OOM watcher before closing IO.
+	if ac != nil && ac.cancelOOM != nil {
+		ac.cancelOOM()
+	}
 
 	// Close stdio and log driver.
 	if ac != nil && ac.io != nil {
@@ -928,6 +1086,107 @@ func generateID() (string, error) {
 	}
 
 	return hex.EncodeToString(b), nil
+}
+
+// AttachOpts configures a container attach session.
+type AttachOpts struct {
+	Conn   io.ReadWriteCloser
+	Stdin  bool
+	Stdout bool
+	Stderr bool
+	TTY    bool
+}
+
+// Attach connects a client to a running container's stdio.
+// It blocks until the container exits or the client disconnects.
+func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error {
+	// Wait for the container to appear in the active map (Docker CLI sends
+	// attach before start for `docker run`).
+	var ac *activeContainer
+
+	for {
+		m.mu.Lock()
+		ac = m.active[id]
+		m.mu.Unlock()
+
+		if ac != nil {
+			break
+		}
+
+		record, err := m.store.GetContainer(id)
+		if err != nil {
+			return fmt.Errorf("runtime: attach: %w", err)
+		}
+
+		if record.State.Status == container.StateExited || record.State.Status == container.StateDead {
+			return nil
+		}
+
+		select {
+		case <-time.After(WaitPollInterval):
+		case <-ctx.Done():
+			return fmt.Errorf("runtime: attach canceled: %w", ctx.Err())
+		}
+	}
+
+	// Register output writer.
+	if opts.Stdout || opts.Stderr {
+		ac.io.AddAttachWriter(opts.Conn)
+		defer ac.io.RemoveAttachWriter(opts.Conn)
+	}
+
+	// Forward stdin from client to container.
+	stdinDone := make(chan struct{})
+
+	if opts.Stdin {
+		go func() {
+			defer close(stdinDone)
+
+			buf := make([]byte, 32*1024)
+
+			for {
+				n, err := opts.Conn.Read(buf)
+				if n > 0 {
+					if _, wErr := ac.io.WriteStdin(buf[:n]); wErr != nil {
+						return
+					}
+				}
+
+				if err != nil {
+					return
+				}
+			}
+		}()
+	} else {
+		close(stdinDone)
+	}
+
+	// Block until container exits or client disconnects.
+	select {
+	case <-ac.done:
+	case <-stdinDone:
+	case <-ctx.Done():
+	}
+
+	return nil
+}
+
+// Resize sets the terminal window size for a running container.
+func (m *Manager) Resize(_ context.Context, id string, height, width uint16) error {
+	record, err := m.store.GetContainer(id)
+	if err != nil {
+		return fmt.Errorf("runtime: %w", err)
+	}
+
+	m.mu.Lock()
+	ac := m.active[record.ID]
+	m.mu.Unlock()
+
+	if ac == nil {
+		return fmt.Errorf("runtime: %w: %s", ErrNotRunning, record.ID[:12])
+	}
+
+	return ac.io.ResizePTY(height, width)
 }
 
 func readPIDFile(path string) (int, error) {

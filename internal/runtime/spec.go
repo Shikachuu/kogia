@@ -106,7 +106,7 @@ func GenerateSpec(opts *SpecOpts) (*ocispec.Spec, error) {
 		Version:  "1.2.0",
 		Hostname: opts.Hostname,
 		Process: &ocispec.Process{
-			Terminal:        false,
+			Terminal:        opts.Config != nil && opts.Config.Tty,
 			User:            user,
 			Args:            args,
 			Env:             env,
