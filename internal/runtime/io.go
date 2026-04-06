@@ -62,30 +62,36 @@ func (cio *containerIO) startCopyLoop() {
 func (cio *containerIO) copyStream(r *os.File, stream string) {
 	defer cio.wg.Done()
 
-	scanner := bufio.NewScanner(r)
-	// Increase buffer size to handle long lines.
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	br := bufio.NewReaderSize(r, 64*1024)
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		// Append newline to match Docker behavior.
-		lineWithNL := make([]byte, len(line)+1)
-		copy(lineWithNL, line)
-		lineWithNL[len(lineWithNL)-1] = '\n'
+	for {
+		line, err := br.ReadBytes('\n')
 
-		msg := &clog.Message{
-			Stream:    stream,
-			Line:      lineWithNL,
-			Timestamp: time.Now(),
+		// Log any data we got, even on error (handles final partial lines on EOF).
+		if len(line) > 0 {
+			// If the line doesn't end with a newline (partial line at EOF), append one.
+			if line[len(line)-1] != '\n' {
+				line = append(line, '\n')
+			}
+
+			msg := &clog.Message{
+				Stream:    stream,
+				Line:      line,
+				Timestamp: time.Now(),
+			}
+
+			if logErr := cio.driver.Log(msg); logErr != nil {
+				slog.Error("log driver write error", "stream", stream, "err", logErr)
+			}
 		}
 
-		if err := cio.driver.Log(msg); err != nil {
-			slog.Error("log driver write error", "stream", stream, "err", err)
-		}
-	}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				slog.Debug("stdio read ended", "stream", stream, "err", err)
+			}
 
-	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
-		slog.Debug("stdio scan ended", "stream", stream, "err", err)
+			break
+		}
 	}
 }
 
@@ -103,7 +109,7 @@ func (cio *containerIO) MarkWritersClosed() {
 // Close closes the write ends of the pipes (unblocking readers),
 // waits for copy goroutines to finish, then closes everything.
 func (cio *containerIO) Close() {
-	// Close write ends — this will cause the scanners to get EOF.
+	// Close write ends — this will cause the readers to get EOF.
 	// Skip if already closed by Start() after passing to crun.
 	if !cio.writersClosed {
 		_ = cio.stdout.Close()

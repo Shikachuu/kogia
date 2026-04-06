@@ -64,6 +64,9 @@ func Run(ctx context.Context, cfg *Config) error {
 		slog.Warn("failed to set subreaper (container supervision may not work)", "err", err)
 	}
 
+	// Protect daemon from OOM killer. Same as dockerd, containerd, and conmon-rs.
+	protectFromOOM()
+
 	// Open bbolt state store.
 	dbPath := filepath.Join(cfg.RootDir, "kogia.db")
 
@@ -166,6 +169,15 @@ func extractCrun(path string) error {
 	}
 
 	return nil
+}
+
+// protectFromOOM sets the daemon's OOM score adjustment to -1000 (maximum
+// protection) so the kernel OOM killer avoids killing us. Best-effort — logs
+// a warning if it fails (e.g., insufficient privileges).
+func protectFromOOM() {
+	if err := os.WriteFile("/proc/self/oom_score_adj", []byte("-1000"), 0o600); err != nil {
+		slog.Warn("failed to set OOM score (daemon may be killed under memory pressure)", "err", err)
+	}
 }
 
 func writePID(path string) error {

@@ -47,11 +47,13 @@ type Manager struct {
 
 // activeContainer tracks a running container's ephemeral state.
 type activeContainer struct {
-	done           chan struct{}
-	io             *containerIO
-	id             string
-	pid            int
-	manuallyStopped bool // set by Stop() to prevent restart for unless-stopped policy
+	done            chan struct{}
+	io              *containerIO
+	id              string
+	bundleDir       string
+	cgroupPath      string
+	pid             int
+	manuallyStopped bool
 }
 
 // ManagerConfig holds configuration for the runtime Manager.
@@ -107,9 +109,20 @@ func (m *Manager) RecoverOrphans(ctx context.Context) {
 			record.State.Running = false
 			record.State.Restarting = false
 			record.State.Pid = 0
-			record.State.ExitCode = 137 // Killed.
 			record.State.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			record.State.Error = "daemon crashed while container was running"
+
+			// Try to recover real exit code from persistent exitcode file.
+			bundleDir, _ := m.store.GetContainerBundle(record.ID)
+
+			exitCode, oomKilled, readErr := readExitCodeFile(bundleDir)
+			if readErr == nil {
+				record.State.ExitCode = exitCode
+				record.State.OOMKilled = oomKilled
+				record.State.Error = "daemon crashed while container was running (exit code recovered)"
+			} else {
+				record.State.ExitCode = 137 // Killed — fallback when no exitcode file.
+				record.State.Error = "daemon crashed while container was running"
+			}
 
 			if updateErr := m.store.UpdateContainer(record); updateErr != nil {
 				slog.Error("failed to update orphaned container", "id", record.ID[:12], "err", updateErr)
@@ -409,12 +422,22 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 	// Register in active map + pidMap BEFORE crun start. This prevents a
 	// race where the container exits instantly (e.g., hello-world) and the
 	// reaper processes SIGCHLD before we register the PID.
+	// Resolve cgroup path from /proc/{pid}/cgroup for accurate OOM detection.
+	cgPath, cgErr := resolveCgroupPath(pid)
+	if cgErr != nil {
+		slog.Debug("failed to resolve cgroup path, using default", "pid", pid, "err", cgErr)
+
+		cgPath = "/sys/fs/cgroup/kogia/" + record.ID[:12]
+	}
+
 	m.mu.Lock()
 	ac := &activeContainer{
-		pid:  pid,
-		id:   record.ID,
-		done: make(chan struct{}),
-		io:   cio,
+		pid:        pid,
+		id:         record.ID,
+		done:       make(chan struct{}),
+		io:         cio,
+		bundleDir:  bundleDir,
+		cgroupPath: cgPath,
 	}
 	m.active[record.ID] = ac
 	m.pidMap[pid] = record.ID
@@ -486,8 +509,8 @@ func (m *Manager) Stop(ctx context.Context, id string, timeout int) error {
 	termCtx, termCancel := context.WithTimeout(ctx, CrunOperationTimeout)
 	defer termCancel()
 
-	if killErr := m.crun.kill(termCtx, record.ID, DefaultStopSignal); killErr != nil {
-		slog.Debug("crun kill SIGTERM failed (container may have already exited)", "id", record.ID[:12], "err", killErr)
+	if killErr := m.crun.killAll(termCtx, record.ID, DefaultStopSignal); killErr != nil {
+		slog.Debug("crun kill --all SIGTERM failed (container may have already exited)", "id", record.ID[:12], "err", killErr)
 	}
 
 	// Wait for exit or timeout.
@@ -506,8 +529,8 @@ func (m *Manager) Stop(ctx context.Context, id string, timeout int) error {
 		sigkillCtx, sigkillCancel := context.WithTimeout(ctx, CrunOperationTimeout)
 		defer sigkillCancel()
 
-		if sigkillErr := m.crun.kill(sigkillCtx, record.ID, DefaultKillSignal); sigkillErr != nil {
-			slog.Debug("crun kill SIGKILL failed", "id", record.ID[:12], "err", sigkillErr)
+		if sigkillErr := m.crun.killAll(sigkillCtx, record.ID, DefaultKillSignal); sigkillErr != nil {
+			slog.Debug("crun kill --all SIGKILL failed", "id", record.ID[:12], "err", sigkillErr)
 		}
 
 		// Wait for the reaper to collect.

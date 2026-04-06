@@ -4,15 +4,26 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
+)
+
+var (
+	// errNoCgroupV2 is returned when /proc/{pid}/cgroup has no cgroup v2 entry.
+	errNoCgroupV2 = errors.New("no cgroup v2 entry found")
+	// errEmptyBundleDir is returned when an empty bundle dir is passed.
+	errEmptyBundleDir = errors.New("empty bundle dir")
+	// errMalformedExitCode is returned when the exitcode file has invalid format.
+	errMalformedExitCode = errors.New("malformed exitcode file")
 )
 
 // SetSubreaper sets the current process as a subreaper so that orphaned
@@ -70,12 +81,27 @@ func (m *Manager) reapChildren() {
 
 		var oomKilled bool
 
+		var bundleDir, cgroupPath string
+
 		m.mu.Lock()
 		id, ok := m.pidMap[pid]
+
+		if ok {
+			if ac := m.active[id]; ac != nil {
+				bundleDir = ac.bundleDir
+				cgroupPath = ac.cgroupPath
+			}
+		}
 		m.mu.Unlock()
 
-		if ok && len(id) >= 12 {
-			oomKilled = isOOMKilled("/sys/fs/cgroup/kogia/" + id[:12])
+		if ok && cgroupPath != "" {
+			oomKilled = isOOMKilled(cgroupPath)
+		}
+
+		// Persist exit status to file before HandleExit so RecoverOrphans
+		// can read the real exit code if the daemon crashes mid-update.
+		if bundleDir != "" {
+			writeExitCodeFile(bundleDir, exitCode, oomKilled)
 		}
 
 		slog.Debug("reaped child process", "pid", pid, "exitCode", exitCode, "oomKilled", oomKilled)
@@ -88,7 +114,7 @@ func (m *Manager) reapChildren() {
 // briefly after the process exits. This is best-effort — if the file
 // is already gone or unparseable, we return false.
 func isOOMKilled(cgroupPath string) bool {
-	data, err := os.ReadFile(cgroupPath + "/memory.events") //nolint:gosec // path is constructed from trusted cgroup prefix + container ID.
+	data, err := os.ReadFile(cgroupPath + "/memory.events") //nolint:gosec // path is constructed from resolved cgroup path.
 	if err != nil {
 		return false
 	}
@@ -105,4 +131,70 @@ func isOOMKilled(cgroupPath string) bool {
 	}
 
 	return false
+}
+
+// resolveCgroupPath reads /proc/{pid}/cgroup to find the container's cgroup v2 path.
+// Returns the full sysfs path (e.g., /sys/fs/cgroup/kogia/<id>).
+func resolveCgroupPath(pid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return "", fmt.Errorf("read cgroup file: %w", err)
+	}
+
+	for line := range strings.SplitSeq(string(data), "\n") {
+		// cgroup v2 unified hierarchy line: "0::<path>"
+		if !strings.HasPrefix(line, "0::") {
+			continue
+		}
+
+		relPath := strings.TrimPrefix(line, "0::")
+
+		return "/sys/fs/cgroup" + relPath, nil
+	}
+
+	return "", fmt.Errorf("%w in /proc/%d/cgroup", errNoCgroupV2, pid)
+}
+
+const exitCodeFileName = "exitcode"
+
+// writeExitCodeFile persists the exit code and OOM status to a file in the
+// bundle directory. This is best-effort — used by RecoverOrphans to read
+// real exit codes after a daemon crash.
+func writeExitCodeFile(bundleDir string, exitCode int, oomKilled bool) {
+	content := strconv.Itoa(exitCode) + "\n" + strconv.FormatBool(oomKilled) + "\n"
+	path := filepath.Join(bundleDir, exitCodeFileName)
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		slog.Warn("failed to write exitcode file", "path", path, "err", err)
+	}
+}
+
+// readExitCodeFile reads a previously written exitcode file.
+// Returns an error if the file is missing or malformed.
+func readExitCodeFile(bundleDir string) (exitCode int, oomKilled bool, err error) {
+	if bundleDir == "" {
+		return 0, false, errEmptyBundleDir
+	}
+
+	data, err := os.ReadFile(filepath.Join(bundleDir, exitCodeFileName)) //nolint:gosec // path is constructed from trusted bundle dir.
+	if err != nil {
+		return 0, false, fmt.Errorf("read exitcode file: %w", err)
+	}
+
+	lines := strings.SplitN(string(data), "\n", 3) //nolint:mnd // exactly 2 data lines + optional trailing empty.
+	if len(lines) < 2 {
+		return 0, false, fmt.Errorf("%w: expected 2 lines", errMalformedExitCode)
+	}
+
+	exitCode, err = strconv.Atoi(lines[0])
+	if err != nil {
+		return 0, false, fmt.Errorf("parse exit code: %w", err)
+	}
+
+	oomKilled, err = strconv.ParseBool(lines[1])
+	if err != nil {
+		return 0, false, fmt.Errorf("parse oom killed: %w", err)
+	}
+
+	return exitCode, oomKilled, nil
 }

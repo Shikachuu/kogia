@@ -84,6 +84,12 @@ func (c *CrunConfig) kill(ctx context.Context, id, signal string) error {
 	return c.run(ctx, "kill", id, signal)
 }
 
+// killAll sends a signal to all processes in the container's cgroup.
+// Used by Stop() to ensure child processes also receive the signal.
+func (c *CrunConfig) killAll(ctx context.Context, id, signal string) error {
+	return c.run(ctx, "kill", "--all", id, signal)
+}
+
 // deleteContainer runs `crun delete --force` to clean up container state.
 func (c *CrunConfig) deleteContainer(ctx context.Context, id string) error {
 	return c.run(ctx, "delete", "--force", id)
