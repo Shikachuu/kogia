@@ -34,13 +34,13 @@ docker CLI → REST/JSON over Unix socket → kogia daemon → crun (fork/exec) 
 | `internal/api/server.go` | HTTP server, middleware, Unix socket listener |
 | `internal/runtime/` | crun lifecycle (create/start/stop/kill/remove), OCI spec generation, stdio, supervision |
 | `internal/image/` | Pull, store, auth — via containers/image + containers/storage |
-| `internal/network/` | Bridge networking (netlink), NAT (nftables), DNS (miekg/dns), IPAM, CNI |
+| `internal/network/` | Bridge networking (netlink), NAT (nftables), DNS (miekg/dns), IPAM |
 | `internal/store/` | bbolt state persistence |
 | `internal/volume/` | Named volume management |
 | `internal/events/` | Event fan-out bus (container/image/network/volume lifecycle) |
 | `internal/metrics/` | Opt-in Prometheus metrics |
 | `cmd/kogia/` | CLI entry point (cobra) |
-| `cmd/kogia-cni/` | Standalone CNI plugin binary |
+
 
 ## Key Architectural Decisions
 
@@ -49,7 +49,7 @@ docker CLI → REST/JSON over Unix socket → kogia daemon → crun (fork/exec) 
 - **Streaming:** moby stdcopy imported for attach/logs/exec wire format (not captured in Swagger)
 - **Image stack:** containers/image + containers/storage — Podman-grade, handles all registry/layer/overlayfs complexity
 - **State:** bbolt — pure Go, single-writer, no CGo
-- **Networking:** in-process netlink + nftables + miekg/dns — no external CNI daemon
+- **Networking:** in-process netlink + nftables + miekg/dns — no external binaries or daemons
 - **Error handling:** errdefs + SafeError pattern — see [`docs/error-handling.md`](docs/error-handling.md)
 - **Logging:** `log/slog` (stdlib structured JSON)
 - **No CGo:** entire codebase builds with `CGO_ENABLED=0`

@@ -30,24 +30,6 @@ builds:
       - -X main.date={{ .Date }}
       - -X main.dockerAPIVersion={{ .Env.DOCKER_API_VERSION }}
 
-  - id: kogia-cni
-    main: ./cmd/kogia-cni
-    binary: bin/{{ .ProjectName }}-cni-{{ .Os }}-{{ .Arch }}
-    no_unique_dist_dir: true
-    env:
-      - CGO_ENABLED=0
-    flags:
-      - -trimpath
-    goos:
-      - linux
-    goarch:
-      - amd64
-      - arm64
-    ldflags:
-      - -s -w
-      - -X main.version={{ .Version }}
-      - -X main.commit={{ .Commit }}
-      - -X main.date={{ .Date }}
 
 archives:
   - formats: [binary]

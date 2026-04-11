@@ -6,7 +6,7 @@ Kogia is a minimal, memory-efficient Docker Engine API-compatible container runt
 
 The Go implementation trades ~3-4x more memory than a theoretical Rust version for near-free API compat via generated types from Docker's Swagger spec, battle-tested image/storage libraries (containers/image, containers/storage), and dramatically lower maintenance burden. It's ~5x lighter than Docker and lighter than Podman in daemon mode (~50-80 MB).
 
-Based on research in `cni-research.md` and `observability-research.md`.
+Based on research in `observability-research.md`.
 
 ---
 
@@ -49,7 +49,7 @@ Official Docker CLI / docker compose / docker buildx
 | Image management | containers/image + containers/storage | Full Podman-grade stack. Handles registry auth, layer extraction, overlayfs whiteouts, all storage driver complexity |
 | Rootfs | containers/storage Mount/Unmount | No hand-rolled overlayfs |
 | State | bbolt (go.etcd.io/bbolt) | Pure Go, no CGo, proven (etcd/Kubernetes). Single-writer but sufficient. |
-| Networking | vishvananda/netlink + google/nftables + miekg/dns (in-process) | Custom CNI-compatible. internal/network/ code + thin cmd/kogia-cni binary |
+| Networking | vishvananda/netlink + google/nftables + miekg/dns (in-process) | Fully in-process, no external binaries. internal/network/ |
 | DNS | miekg/dns authoritative server on bridge gateway IP | Dynamic updates as containers join/leave. resolv.conf points containers here |
 | BuildKit | docker-container buildx driver | Builds use `docker buildx` with the docker-container driver, which manages its own buildkitd container. No in-daemon build subprocess. |
 | Container supervision | In-daemon goroutine per container | Subreaper + SIGCHLD reaper collects exit codes, manages stdio, updates bbolt. Exit codes persisted to `exitcode` file for crash recovery. Live OOM detection via inotify watch on cgroup v2 `memory.events` (with post-mortem fallback). Dynamically resolved cgroup path. Daemon protected from OOM killer (`oom_score_adj=-1000`). |
@@ -103,8 +103,6 @@ kogia/
 ├── cmd/
 │   ├── kogia/
 │   │   └── main.go                  # cobra CLI, daemon subcommand
-│   └── kogia-cni/
-│       └── main.go                  # standalone CNI plugin binary (thin shim)
 ├── internal/
 │   ├── daemon/
 │   │   └── daemon.go                # startup orchestrator, signal handling, shutdown sequence
@@ -144,7 +142,6 @@ kogia/
 │   │   ├── ipam.go                  # bitmap IPAM per subnet (bbolt-backed)
 │   │   ├── nat.go                   # nftables: masquerade, DNAT port mapping
 │   │   ├── dns.go                   # miekg/dns: authoritative DNS + host forwarding
-│   │   └── cni.go                   # CNI protocol handler (ADD/DEL/CHECK/VERSION)
 │   ├── store/
 │   │   ├── db.go                    # bbolt setup, bucket structure, generic helpers
 │   │   ├── container.go             # container state CRUD + name index (resolves ID, name, /name, ID prefix)
@@ -191,9 +188,6 @@ github.com/google/nftables            # NAT, port mapping, firewall
 
 # DNS
 github.com/miekg/dns                 # container DNS server
-
-# CNI (for cmd/kogia-cni)
-github.com/containernetworking/cni    # CNI spec types + skel framework
 
 # Metrics
 github.com/prometheus/client_golang    # Prometheus metrics + /metrics handler
@@ -426,37 +420,44 @@ docker rm -f oom
 
 ---
 
-### Phase 4: Networking
+### Phase 4: Networking (partially implemented)
 **Goal:** Bridge networking, port mapping, DNS resolution, container-to-container communication.
 
-**Create:**
-- `internal/network/bridge.go` — `createBridge(name, gateway, subnet)` via netlink. `connectContainer(bridge, containerPid, containerIP)`: create veth pair, move one end to container netns, assign IP, set default route, attach host end to bridge. `disconnectContainer(vethHost)`.
-- `internal/network/ipam.go` — per-subnet bitmap in bbolt `ipam` bucket. `Allocate(subnet) → IP`, `Release(subnet, ip)`. Skip .0 (network) and .1 (gateway).
-- `internal/network/nat.go` — nftables table `kogia` with chains: `postrouting` (masquerade per subnet), `prerouting` (DNAT per port mapping), `forward` (allow inter-container + external). `AddPortMapping()`, `RemovePortMapping()`, `Cleanup()` (flush table).
-- `internal/network/dns.go` — miekg/dns server on each bridge gateway IP:53 (UDP+TCP). In-memory name→IP map per network, synced from bbolt on startup. `Register(network, name, ip)`, `Deregister(network, name)`. Forward unknown queries to host nameservers from `/etc/resolv.conf`.
-- `internal/network/manager.go` — orchestrates the above. On startup: create default "bridge" network (172.17.0.0/16). Transactional connect: IPAM allocate → bridge create → veth → IP assign → nftables → DNS register → write /etc/resolv.conf. Rollback on any step failure via defer cleanup stack.
-- `internal/network/cni.go` — CNI spec 1.0.0 handler (ADD/DEL/CHECK/VERSION). Reads env vars + stdin config, delegates to same bridge/IPAM/NAT code, returns CNI result JSON on stdout.
-- `cmd/kogia-cni/main.go` — thin binary calling `network.CNIMain()`
-- `internal/store/network.go` — bbolt CRUD for networks + endpoints
-- `internal/api/handlers/network.go` — `GET /networks`, `GET /networks/{id}`, `POST /networks/create`, `DELETE /networks/{id}`, `POST /networks/{id}/connect`, `POST /networks/{id}/disconnect`, `POST /networks/prune`
-- **Modify** `internal/runtime/spec.go` — add network namespace to OCI spec, generate and bind-mount `/etc/hosts`, `/etc/resolv.conf`, `/etc/hostname`
-- **Modify** `internal/runtime/container.go` — on start: create netns, call `network.Connect()` per network, set up port mappings. On stop: remove NAT rules, deregister DNS, release IPs.
+**Implemented:**
+- `internal/network/types.go` — `Record`, `EndpointRecord`, `PortMapping` types.
+- `internal/network/bridge.go` — `CreateBridge(name, gateway, subnet)` via netlink (idempotent, configures `ip_forward` + `route_localnet` sysctls on every call). `ConnectContainer(bridge, pid, containerIP, gateway, subnet)`: create veth pair with random temp names in host ns, move peer to container netns, rename to `eth0`, assign IP, set default route, attach host end to bridge. `DisconnectContainer(vethHost)`.
+- `internal/network/ipam.go` — per-subnet bitmap in bbolt `ipam` bucket. `Allocate(subnet) → IP`, `AllocateSpecific(subnet, ip)`, `Release(subnet, ip)`, `Count(subnet)`, `ReleaseSubnet(subnet)`. Skip .0 (network) and .1 (gateway). Bitmap scanning via `math/bits.TrailingZeros8`.
+- `internal/network/nat.go` — nftables table `kogia` with chains: `postrouting` (masquerade per subnet + localhost hairpin masquerade for `127.0.0.0/8 → subnet`), `prerouting` (DNAT per port mapping), `output` (DNAT for locally-originated traffic — required for `curl localhost:<port>` from host), `forward` (allow inter-container + external). Address and port loaded into separate nftables registers for DNAT. Rule pairs tracked for targeted removal.
+- `internal/network/dns.go` — miekg/dns authoritative server on each bridge gateway IP:53 (UDP+TCP). In-memory `networkID → containerName → IP` map. `Register`, `Deregister`, `DeregisterNetwork`. Forward unknown queries to host nameservers from `/etc/resolv.conf` with 30s cache. DNS only enabled on user-defined networks (not default bridge), matching Docker behavior. Supports A records + PTR reverse lookups.
+- `internal/network/manager.go` — orchestrates the above. On startup: restore networks from bbolt, recreate bridges (idempotent), restore nftables/DNS state, create default "bridge" network (`172.20.0.0/16`, gateway `172.20.0.1`, bridge `kogia0`), create predefined "host" and "none" virtual network records. Transactional connect with defer cleanup stack rollback. Subnet auto-assignment: `172.21-31.0.0/16`, then `192.168.{0-240}.0/20`. Generates `/etc/hostname`, `/etc/hosts`, `/etc/resolv.conf` per container. Dynamic `/etc/hosts` updates when containers join/leave networks. Default subnet uses `172.20.0.0/16` to avoid conflict with Docker's `172.17.0.0/16`.
+- `internal/store/network.go` — bbolt CRUD for networks (with name→ID index, prefix lookup), endpoints (composite key `{networkID}/{containerID}`), IPAM bitmaps. Four new buckets: `networks`, `network-names`, `endpoints`, `ipam`.
+- `internal/api/handlers/network.go` — all 7 endpoints: `POST /networks/create`, `DELETE /networks/{id}`, `GET /networks/{id}`, `GET /networks`, `POST /networks/{id}/connect`, `POST /networks/{id}/disconnect`, `POST /networks/prune`. Predefined networks (bridge, host, none) protected from removal.
+- **Modified** `internal/runtime/spec.go` — `buildNamespaces(networkMode, nsPath)` replaces `defaultNamespaces()`. Network modes: `bridge`/default (new netns, no path — crun creates), `host` (no netns — share host), `none` (new empty netns), `container:<id>` (shared netns via `/proc/{pid}/ns/net`). Extra bind mounts for `/etc/{hostname,hosts,resolv.conf}`.
+- **Modified** `internal/runtime/container.go` — `NetworkManager` field on `Manager`/`ManagerConfig`. `buildContainerRecord` resolves network mode, creates placeholder `/etc` files, resolves `container:<id>` target PID. `setupContainerNetworking` called in `Start()` after `crun create` (PID known) before `crun start`: connects to network, resolves port mappings (including ephemeral ports), generates `/etc` files, populates `NetworkSettings.Networks` on inspect response. `HandleExit` and `Remove` call `DisconnectAll`. `Wait` handles auto-remove race with cached exit code fallback.
+- **Modified** `internal/daemon/daemon.go` — creates `network.Manager`, calls `Init()`, injects into `runtime.Manager` and `handlers.New()`, `Close()` on shutdown (before store close).
+- **Modified** `internal/api/handlers/handlers.go` — `network *network.Manager` field, updated `New()` signature.
+- **Modified** `internal/store/db.go` — registers 4 new bbolt buckets.
 
-**Verify:**
+**Verified:**
 ```bash
 docker run -d --name web -p 8080:80 nginx
-curl localhost:8080                              # nginx welcome page
+curl localhost:8080                              # ✅ nginx welcome page
 
 docker network create mynet
-docker run -d --name db --network mynet redis
-docker run --rm --network mynet alpine ping -c1 db
-docker run --rm --network mynet alpine nslookup db
+docker run -d --name db --network mynet alpine sleep 3600
+docker run -d --name app --network mynet alpine sleep 3600
+# container-to-container ping by IP           # ✅
+# DNS resolution by container name            # ✅
+# /etc/hosts has entries for peer containers  # ✅
+# /etc/resolv.conf points to gateway DNS      # ✅
 
-docker run --rm alpine wget -qO- http://example.com  # outbound NAT
+docker run --rm alpine wget -qO- http://example.com  # ✅ outbound NAT
 
-docker network inspect mynet
-docker stop web db && docker rm web db
-docker network rm mynet
+docker network ls                                # ✅
+docker network inspect mynet                     # ✅
+docker network rm bridge                         # ✅ rejected (predefined)
+docker network prune -f                          # ✅ removes unused networks
+docker network rm mynet                          # ✅ after disconnecting containers
 ```
 
 ---
@@ -595,7 +596,7 @@ SIGTERM/SIGINT received →
 
 - **Per-phase:** test with real `docker` CLI commands as shown above
 - **Compat debugging:** `socat -v UNIX-LISTEN:/tmp/proxy.sock,fork UNIX-CONNECT:/var/run/docker.sock` to capture real Docker traffic, diff against kogia's responses
-- **Unit tests:** focus on `spec.go` (highest risk), bbolt CRUD, IPAM bitmap, CNI protocol
+- **Unit tests:** focus on `spec.go` (highest risk), bbolt CRUD, IPAM bitmap
 - **CI:** GitHub Actions with privileged runner (needs root for namespaces, cgroups, overlayfs)
 - **Logging:** `log/slog` structured logging, configurable via `--log-level`
 
