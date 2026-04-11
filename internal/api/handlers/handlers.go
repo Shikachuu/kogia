@@ -4,6 +4,7 @@ package handlers
 import (
 	"github.com/Shikachuu/kogia/internal/api/gen"
 	"github.com/Shikachuu/kogia/internal/image"
+	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
 )
@@ -15,6 +16,7 @@ type Handlers struct {
 	store            *store.Store
 	images           *image.Store
 	runtime          *runtime.Manager
+	network          *network.Manager
 	version          string
 	commit           string
 	date             string
@@ -22,11 +24,12 @@ type Handlers struct {
 }
 
 // New creates a new Handlers instance.
-func New(s *store.Store, images *image.Store, rt *runtime.Manager, version, commit, date, dockerAPIVersion string) *Handlers {
+func New(s *store.Store, images *image.Store, rt *runtime.Manager, net *network.Manager, version, commit, date, dockerAPIVersion string) *Handlers {
 	return &Handlers{
 		store:            s,
 		images:           images,
 		runtime:          rt,
+		network:          net,
 		version:          version,
 		commit:           commit,
 		date:             date,

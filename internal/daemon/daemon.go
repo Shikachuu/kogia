@@ -14,6 +14,7 @@ import (
 	"github.com/Shikachuu/kogia/internal/api"
 	"github.com/Shikachuu/kogia/internal/api/handlers"
 	"github.com/Shikachuu/kogia/internal/image"
+	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
 )
@@ -31,6 +32,8 @@ type Config struct {
 }
 
 // Run starts the kogia daemon and blocks until ctx is canceled.
+//
+//nolint:gocyclo // Run orchestrates the full daemon lifecycle with sequential init steps.
 func Run(ctx context.Context, cfg *Config) error {
 	if err := os.MkdirAll(cfg.RootDir, 0o710); err != nil {
 		return fmt.Errorf("daemon: mkdir root: %w", err)
@@ -97,6 +100,19 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}()
 
+	// Initialize network manager.
+	netMgr := network.NewManager(s, cfg.RootDir)
+
+	if initErr := netMgr.Init(); initErr != nil {
+		return fmt.Errorf("daemon: init network manager: %w", initErr)
+	}
+
+	defer func() {
+		if closeErr := netMgr.Close(); closeErr != nil {
+			slog.Error("failed to close network manager", "err", closeErr)
+		}
+	}()
+
 	// Initialize runtime manager.
 	crunRootDir := filepath.Join(socketDir, "crun-state")
 
@@ -111,11 +127,12 @@ func Run(ctx context.Context, cfg *Config) error {
 	}
 
 	rt := runtime.NewManager(runtime.ManagerConfig{
-		CrunBinary: crunPath,
-		CrunRoot:   crunRootDir,
-		BundleRoot: bundleRoot,
-		Store:      s,
-		Images:     images,
+		CrunBinary:     crunPath,
+		CrunRoot:       crunRootDir,
+		BundleRoot:     bundleRoot,
+		Store:          s,
+		Images:         images,
+		NetworkManager: netMgr,
 	})
 
 	// Clean up containers orphaned by a previous crash.
@@ -125,7 +142,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	rt.StartReaper(ctx)
 
 	// Create HTTP handlers and server.
-	h := handlers.New(s, images, rt, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
+	h := handlers.New(s, images, rt, netMgr, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
 	srv := api.New(cfg.SocketPath, cfg.DockerAPIVersion, h)
 
 	if err = srv.Start(); err != nil {
