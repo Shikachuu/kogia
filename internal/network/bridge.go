@@ -29,38 +29,46 @@ func (b *Bridge) CreateBridge(name string, gateway netip.Addr, subnet netip.Pref
 		},
 	}
 
+	alreadyExists := false
+
 	if addErr := netlink.LinkAdd(br); addErr != nil {
 		if os.IsExist(addErr) {
-			return nil // Bridge already exists (idempotent).
+			alreadyExists = true
+		} else {
+			return fmt.Errorf("bridge: create %s: %w", name, addErr)
+		}
+	}
+
+	if !alreadyExists {
+		// Assign gateway IP to the bridge.
+		addr := &netlink.Addr{
+			IPNet: &net.IPNet{
+				IP:   gateway.AsSlice(),
+				Mask: net.CIDRMask(subnet.Bits(), 32),
+			},
 		}
 
-		return fmt.Errorf("bridge: create %s: %w", name, addErr)
+		if addrErr := netlink.AddrAdd(br, addr); addrErr != nil {
+			_ = netlink.LinkDel(br)
+
+			return fmt.Errorf("bridge: add addr %s to %s: %w", gateway, name, addrErr)
+		}
+
+		// Bring the bridge up.
+		if upErr := netlink.LinkSetUp(br); upErr != nil {
+			_ = netlink.LinkDel(br)
+
+			return fmt.Errorf("bridge: set up %s: %w", name, upErr)
+		}
 	}
 
-	// Assign gateway IP to the bridge.
-	addr := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   gateway.AsSlice(),
-			Mask: net.CIDRMask(subnet.Bits(), 32),
-		},
-	}
-
-	if addrErr := netlink.AddrAdd(br, addr); addrErr != nil {
-		_ = netlink.LinkDel(br)
-
-		return fmt.Errorf("bridge: add addr %s to %s: %w", gateway, name, addrErr)
-	}
-
-	// Bring the bridge up.
-	if upErr := netlink.LinkSetUp(br); upErr != nil {
-		_ = netlink.LinkDel(br)
-
-		return fmt.Errorf("bridge: set up %s: %w", name, upErr)
-	}
-
-	// Enable IP forwarding (required for NAT). Non-fatal.
+	// Always configure sysctls — even for existing bridges (e.g. daemon restart).
 	if fwdErr := enableIPForward(); fwdErr != nil {
 		fmt.Fprintf(os.Stderr, "bridge: warning: enable ip_forward: %v\n", fwdErr)
+	}
+
+	if rlnErr := enableRouteLocalnet(name); rlnErr != nil {
+		fmt.Fprintf(os.Stderr, "bridge: warning: enable route_localnet on %s: %v\n", name, rlnErr)
 	}
 
 	return nil
@@ -98,7 +106,13 @@ func (b *Bridge) ConnectContainer(bridgeName string, pid int, containerIP, gatew
 		return "", "", err
 	}
 
-	vethContainer := "eth0"
+	// Use a temporary random name for the peer in the host namespace to avoid
+	// conflicts (e.g. host already has eth0). It gets renamed to "eth0" inside
+	// the container's netns.
+	peerTmpName, err := generateVethName()
+	if err != nil {
+		return "", "", err
+	}
 
 	// Create the veth pair.
 	veth := &netlink.Veth{
@@ -106,7 +120,7 @@ func (b *Bridge) ConnectContainer(bridgeName string, pid int, containerIP, gatew
 			Name:        vethHost,
 			MasterIndex: br.Attrs().Index,
 		},
-		PeerName: vethContainer,
+		PeerName: peerTmpName,
 	}
 
 	if addErr := netlink.LinkAdd(veth); addErr != nil {
@@ -120,26 +134,27 @@ func (b *Bridge) ConnectContainer(bridgeName string, pid int, containerIP, gatew
 		}
 	}()
 
-	// Get the container-side veth (peer).
-	peer, err := netlink.LinkByName(vethContainer)
+	// Get the container-side veth (peer) by its temporary name.
+	peer, err := netlink.LinkByName(peerTmpName)
 	if err != nil {
-		return "", "", fmt.Errorf("bridge: find peer %s: %w", vethContainer, err)
+		return "", "", fmt.Errorf("bridge: find peer %s: %w", peerTmpName, err)
 	}
 
 	// Generate MAC address: 02:42:xx:xx:xx:xx from container IP.
 	mac = generateMAC(containerIP)
 
 	if macErr := netlink.LinkSetHardwareAddr(peer, mustParseMAC(mac)); macErr != nil {
-		return "", "", fmt.Errorf("bridge: set mac on %s: %w", vethContainer, macErr)
+		return "", "", fmt.Errorf("bridge: set mac on %s: %w", peerTmpName, macErr)
 	}
 
 	// Move peer into the container's network namespace.
 	if nsErr := netlink.LinkSetNsPid(peer, pid); nsErr != nil {
-		return "", "", fmt.Errorf("bridge: move %s to pid %d: %w", vethContainer, pid, nsErr)
+		return "", "", fmt.Errorf("bridge: move %s to pid %d: %w", peerTmpName, pid, nsErr)
 	}
 
 	// Configure networking inside the container's namespace.
-	if cfgErr := configureContainerNetns(pid, vethContainer, containerIP, gateway, subnet); cfgErr != nil {
+	// The interface is renamed from its temporary name to "eth0" inside the netns.
+	if cfgErr := configureContainerNetns(pid, peerTmpName, containerIP, gateway, subnet); cfgErr != nil {
 		return "", "", fmt.Errorf("bridge: configure container netns: %w", cfgErr)
 	}
 
@@ -203,10 +218,21 @@ func configureContainerNetns(pid int, ifName string, containerIP, gateway netip.
 	// Always restore host namespace when done.
 	defer func() { _ = netns.Set(hostNS) }()
 
-	// Find the interface inside the container namespace.
+	// Find the interface inside the container namespace (still has its temp name).
 	link, err := netlink.LinkByName(ifName)
 	if err != nil {
 		return fmt.Errorf("find %s in container: %w", ifName, err)
+	}
+
+	// Rename to eth0.
+	if renameErr := netlink.LinkSetName(link, "eth0"); renameErr != nil {
+		return fmt.Errorf("rename %s to eth0: %w", ifName, renameErr)
+	}
+
+	// Re-fetch after rename.
+	link, err = netlink.LinkByName("eth0")
+	if err != nil {
+		return fmt.Errorf("find eth0 after rename: %w", err)
 	}
 
 	// Assign IP address.
@@ -277,6 +303,19 @@ func mustParseMAC(s string) net.HardwareAddr {
 func enableIPForward() error {
 	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0o644); err != nil { //nolint:gosec // System knob, needs world-readable.
 		return fmt.Errorf("write ip_forward: %w", err)
+	}
+
+	return nil
+}
+
+// enableRouteLocalnet allows routing of 127.0.0.0/8 on the given interface.
+// Required for DNAT from localhost to bridge container IPs. Set per-interface
+// to avoid the global security implications of net.ipv4.conf.all.route_localnet.
+func enableRouteLocalnet(ifName string) error {
+	path := "/proc/sys/net/ipv4/conf/" + ifName + "/route_localnet"
+
+	if err := os.WriteFile(path, []byte("1"), 0o644); err != nil { //nolint:gosec // System knob, needs world-readable.
+		return fmt.Errorf("write route_localnet for %s: %w", ifName, err)
 	}
 
 	return nil

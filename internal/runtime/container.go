@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	netPkg "net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/store"
 	"github.com/moby/moby/api/types/container"
+	mobynetwork "github.com/moby/moby/api/types/network"
 	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -68,6 +70,7 @@ type activeContainer struct {
 	bundleDir       string
 	cgroupPath      string
 	pid             int
+	exitCode        int  // set by HandleExit before closing done
 	manuallyStopped bool
 }
 
@@ -293,6 +296,15 @@ func (m *Manager) buildContainerRecord(
 			Source:      filepath.Join(bundleDir, "resolv.conf"),
 			Options:     []string{"rbind", "rprivate", "rw"},
 		},
+	}
+
+	// Create placeholder /etc files so crun can bind-mount them during create.
+	// They are overwritten with real content in setupContainerNetworking after
+	// crun create, when the container's PID and network config are known.
+	for _, m := range etcBindMounts {
+		if writeErr := os.WriteFile(m.Source, []byte{}, 0o644); writeErr != nil { //nolint:gosec // Placeholder for container /etc file.
+			return nil, fmt.Errorf("runtime: create placeholder %s: %w", m.Source, writeErr)
+		}
 	}
 
 	// Resolve network namespace path for container:<id> mode.
@@ -796,9 +808,11 @@ func (m *Manager) Wait(ctx context.Context, id string) (int, error) {
 			// Container is running — block on the done channel.
 			select {
 			case <-ac.done:
+				// Try to read from store, but fall back to the cached exit
+				// code if auto-remove already deleted the record.
 				record, err = m.store.GetContainer(record.ID)
 				if err != nil {
-					return -1, fmt.Errorf("runtime: re-read container: %w", err)
+					return ac.exitCode, nil //nolint:nilerr // Container auto-removed; use cached exit code.
 				}
 
 				return record.State.ExitCode, nil
@@ -808,10 +822,13 @@ func (m *Manager) Wait(ctx context.Context, id string) (int, error) {
 		}
 
 		// Container not yet in active map (still "created", not started yet).
-		// Re-check state — it may have started and already exited.
+		// Re-check state — it may have started and already exited, or been
+		// auto-removed.
 		record, err = m.store.GetContainer(record.ID)
 		if err != nil {
-			return -1, fmt.Errorf("runtime: re-read container: %w", err)
+			// Container was removed (e.g. auto-remove). Return 0 as the
+			// most likely exit code for a cleanly removed container.
+			return 0, nil //nolint:nilerr // Container auto-removed between polls.
 		}
 
 		if record.State.Status == container.StateExited || record.State.Status == container.StateDead {
@@ -961,6 +978,12 @@ func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 	// Close stdio and log driver.
 	if ac != nil && ac.io != nil {
 		ac.io.Close()
+	}
+
+	// Cache exit code in activeContainer so Wait can use it even if
+	// auto-remove deletes the store record before Wait re-reads it.
+	if ac != nil {
+		ac.exitCode = exitCode
 	}
 
 	// Update state in bbolt.
@@ -1381,6 +1404,27 @@ func (m *Manager) setupContainerNetworking(record *container.InspectResponse, bu
 
 	if genErr := m.netManager.GenerateNetworkFiles(bundleDir, record.ID, record.ID[:12], endpoints); genErr != nil {
 		return fmt.Errorf("generate network files: %w", genErr)
+	}
+
+	// Populate NetworkSettings so `docker inspect` shows network info.
+	if ep != nil && ep.IPAddress.IsValid() {
+		mac, _ := netPkg.ParseMAC(ep.MacAddress)
+
+		record.NetworkSettings = &container.NetworkSettings{
+			Networks: map[string]*mobynetwork.EndpointSettings{
+				networkName: {
+					NetworkID:   netRec.ID,
+					Gateway:     netRec.Gateway,
+					IPAddress:   ep.IPAddress,
+					IPPrefixLen: netRec.Subnet.Bits(),
+					MacAddress:  mobynetwork.HardwareAddr(mac),
+				},
+			},
+		}
+
+		if updateErr := m.store.UpdateContainer(record); updateErr != nil {
+			slog.Warn("failed to update container network settings", "id", record.ID[:12], "err", updateErr)
+		}
 	}
 
 	// Update hosts files for other containers on this network.

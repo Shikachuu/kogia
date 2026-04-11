@@ -24,6 +24,19 @@ type portMappingKey struct {
 	ContainerPort uint16
 }
 
+// masqRulePair stores the outbound masquerade and localhost masquerade rules.
+type masqRulePair struct {
+	outbound  *nftables.Rule // source=subnet → masquerade (outbound NAT)
+	localhost *nftables.Rule // source=127.0.0.0/8, dest=subnet → masquerade (hairpin)
+}
+
+// portMapRulePair stores the prerouting and output DNAT rules for a port mapping
+// so both can be removed together.
+type portMapRulePair struct {
+	prerouting *nftables.Rule
+	output     *nftables.Rule
+}
+
 // NAT manages nftables rules for container networking:
 // masquerade (outbound SNAT), DNAT (port mapping), and forwarding.
 type NAT struct {
@@ -32,19 +45,20 @@ type NAT struct {
 
 	chainPostrouting *nftables.Chain
 	chainPrerouting  *nftables.Chain
+	chainOutput      *nftables.Chain // NAT for locally-originated traffic
 	chainForward     *nftables.Chain
 
 	// Track rules for targeted removal.
-	masqRules    map[string]*nftables.Rule // subnet CIDR -> rule
-	portMapRules map[portMappingKey]*nftables.Rule
+	masqRules    map[string]*masqRulePair // subnet CIDR -> rule pair
+	portMapRules map[portMappingKey]*portMapRulePair
 	mu           sync.Mutex
 }
 
 // NewNAT creates a new NAT manager.
 func NewNAT() *NAT {
 	return &NAT{
-		masqRules:    make(map[string]*nftables.Rule),
-		portMapRules: make(map[portMappingKey]*nftables.Rule),
+		masqRules:    make(map[string]*masqRulePair),
+		portMapRules: make(map[portMappingKey]*portMapRulePair),
 	}
 }
 
@@ -83,6 +97,16 @@ func (n *NAT) Init() error {
 		Priority: nftables.ChainPriorityNATDest,
 	})
 
+	// Output chain: DNAT for locally-originated traffic (e.g. curl localhost:8080
+	// from the host). Without this, only external traffic hits prerouting.
+	n.chainOutput = n.conn.AddChain(&nftables.Chain{
+		Name:     "output",
+		Table:    n.table,
+		Type:     nftables.ChainTypeNAT,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityNATDest,
+	})
+
 	n.chainForward = n.conn.AddChain(&nftables.Chain{
 		Name:     "forward",
 		Table:    n.table,
@@ -113,7 +137,8 @@ func (n *NAT) AddMasquerade(subnet netip.Prefix) error {
 	ones := subnet.Bits()
 	mask := net.CIDRMask(ones, 32)
 
-	rule := n.conn.AddRule(&nftables.Rule{
+	// Rule 1: masquerade outbound traffic from the subnet (containers → internet).
+	outboundRule := n.conn.AddRule(&nftables.Rule{
 		Table: n.table,
 		Chain: n.chainPostrouting,
 		Exprs: []expr.Any{
@@ -143,11 +168,66 @@ func (n *NAT) AddMasquerade(subnet netip.Prefix) error {
 		},
 	})
 
+	// Rule 2: masquerade localhost traffic DNAT'd to this subnet.
+	// Without this, containers see source 127.0.0.1 and respond to their
+	// own loopback instead of back through the bridge.
+	loMask := net.CIDRMask(8, 32)
+	loNet := [4]byte{127, 0, 0, 0}
+
+	localhostRule := n.conn.AddRule(&nftables.Rule{
+		Table: n.table,
+		Chain: n.chainPostrouting,
+		Exprs: []expr.Any{
+			// Match source 127.0.0.0/8.
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       12,
+				Len:          4,
+			},
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           loMask,
+				Xor:            []byte{0, 0, 0, 0},
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     loNet[:],
+			},
+			// Match destination in container subnet.
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16,
+				Len:          4,
+			},
+			&expr.Bitwise{
+				SourceRegister: 1,
+				DestRegister:   1,
+				Len:            4,
+				Mask:           mask,
+				Xor:            []byte{0, 0, 0, 0},
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     subnetIP[:],
+			},
+			&expr.Masq{},
+		},
+	})
+
 	if err := n.conn.Flush(); err != nil {
 		return fmt.Errorf("nat: add masquerade for %s: %w", subnet, err)
 	}
 
-	n.masqRules[key] = rule
+	n.masqRules[key] = &masqRulePair{
+		outbound:  outboundRule,
+		localhost: localhostRule,
+	}
 
 	return nil
 }
@@ -159,13 +239,17 @@ func (n *NAT) RemoveMasquerade(subnet netip.Prefix) error {
 
 	key := subnet.String()
 
-	rule, exists := n.masqRules[key]
+	pair, exists := n.masqRules[key]
 	if !exists {
 		return nil
 	}
 
-	if err := n.conn.DelRule(rule); err != nil {
-		return fmt.Errorf("nat: remove masquerade for %s: %w", subnet, err)
+	if err := n.conn.DelRule(pair.outbound); err != nil {
+		return fmt.Errorf("nat: remove outbound masquerade for %s: %w", subnet, err)
+	}
+
+	if err := n.conn.DelRule(pair.localhost); err != nil {
+		return fmt.Errorf("nat: remove localhost masquerade for %s: %w", subnet, err)
 	}
 
 	if err := n.conn.Flush(); err != nil {
@@ -244,24 +328,39 @@ func (n *NAT) AddPortMapping(hostIP netip.Addr, hostPort uint16, containerIP net
 		}, exprs...)
 	}
 
-	// DNAT to container IP:port.
+	// DNAT to container IP:port. Address and port must be in separate registers.
 	exprs = append(exprs,
 		&expr.Immediate{
 			Register: 1,
-			Data:     append(containerIPBytes[:], portToBytes(containerPort)...),
+			Data:     containerIPBytes[:],
+		},
+		&expr.Immediate{
+			Register: 2,
+			Data:     portToBytes(containerPort),
 		},
 		&expr.NAT{
 			Type:        expr.NATTypeDestNAT,
 			Family:      uint32(nftables.TableFamilyIPv4),
 			RegAddrMin:  1,
-			RegProtoMin: 1,
+			RegProtoMin: 2,
 		},
 	)
 
-	rule := n.conn.AddRule(&nftables.Rule{
+	// Add DNAT to prerouting (external traffic) and output (local traffic).
+	preroutingRule := n.conn.AddRule(&nftables.Rule{
 		Table: n.table,
 		Chain: n.chainPrerouting,
 		Exprs: exprs,
+	})
+
+	// Clone exprs for the output chain (AddRule may mutate the slice).
+	outputExprs := make([]expr.Any, len(exprs))
+	copy(outputExprs, exprs)
+
+	outputRule := n.conn.AddRule(&nftables.Rule{
+		Table: n.table,
+		Chain: n.chainOutput,
+		Exprs: outputExprs,
 	})
 
 	if err := n.conn.Flush(); err != nil {
@@ -269,7 +368,10 @@ func (n *NAT) AddPortMapping(hostIP netip.Addr, hostPort uint16, containerIP net
 			hostIP, hostPort, containerIP, containerPort, proto, err)
 	}
 
-	n.portMapRules[key] = rule
+	n.portMapRules[key] = &portMapRulePair{
+		prerouting: preroutingRule,
+		output:     outputRule,
+	}
 
 	return nil
 }
@@ -287,13 +389,17 @@ func (n *NAT) RemovePortMapping(hostIP netip.Addr, hostPort uint16, containerIP 
 		Protocol:      proto,
 	}
 
-	rule, exists := n.portMapRules[key]
+	pair, exists := n.portMapRules[key]
 	if !exists {
 		return nil
 	}
 
-	if err := n.conn.DelRule(rule); err != nil {
-		return fmt.Errorf("nat: remove port mapping: %w", err)
+	if err := n.conn.DelRule(pair.prerouting); err != nil {
+		return fmt.Errorf("nat: remove prerouting port mapping: %w", err)
+	}
+
+	if err := n.conn.DelRule(pair.output); err != nil {
+		return fmt.Errorf("nat: remove output port mapping: %w", err)
 	}
 
 	if err := n.conn.Flush(); err != nil {
@@ -320,8 +426,8 @@ func (n *NAT) Cleanup() error {
 		return fmt.Errorf("nat: cleanup table: %w", err)
 	}
 
-	n.masqRules = make(map[string]*nftables.Rule)
-	n.portMapRules = make(map[portMappingKey]*nftables.Rule)
+	n.masqRules = make(map[string]*masqRulePair)
+	n.portMapRules = make(map[portMappingKey]*portMapRulePair)
 
 	return nil
 }
