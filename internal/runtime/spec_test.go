@@ -80,9 +80,9 @@ func TestGenerateSpec_HelloWorld(t *testing.T) {
 	assertCapsContain(t, "bounding", spec.Process.Capabilities.Bounding, defaultCaps)
 	assertCapsContain(t, "effective", spec.Process.Capabilities.Effective, defaultCaps)
 
-	// Should have default namespaces: pid, mount, ipc, uts.
+	// Should have default namespaces: pid, mount, ipc, uts, network.
 	assertNamespaces(t, spec.Linux.Namespaces, []ocispec.LinuxNamespaceType{
-		ocispec.PIDNamespace, ocispec.MountNamespace, ocispec.IPCNamespace, ocispec.UTSNamespace,
+		ocispec.PIDNamespace, ocispec.MountNamespace, ocispec.IPCNamespace, ocispec.UTSNamespace, ocispec.NetworkNamespace,
 	})
 
 	// Masked paths present.
@@ -1341,4 +1341,142 @@ func envToMap(env []string) map[string]string {
 	}
 
 	return m
+}
+
+// --- Network namespace mode tests ---
+
+func TestGenerateSpec_HostNetworkMode(t *testing.T) {
+	t.Parallel()
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config:          &container.Config{},
+		HostConfig:      &container.HostConfig{},
+		ImageEntrypoint: []string{"/bin/sh"},
+		RootPath:        "/rootfs",
+		Hostname:        "test",
+		NetworkMode:     "host",
+	})
+	if err != nil {
+		t.Fatalf("GenerateSpec: %v", err)
+	}
+
+	// Host mode: should NOT have a network namespace.
+	for _, ns := range spec.Linux.Namespaces {
+		if ns.Type == ocispec.NetworkNamespace {
+			t.Error("host mode should not have a network namespace")
+		}
+	}
+
+	// Should still have pid, mount, ipc, uts.
+	assertNamespaces(t, spec.Linux.Namespaces, []ocispec.LinuxNamespaceType{
+		ocispec.PIDNamespace, ocispec.MountNamespace, ocispec.IPCNamespace, ocispec.UTSNamespace,
+	})
+}
+
+func TestGenerateSpec_NoneNetworkMode(t *testing.T) {
+	t.Parallel()
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config:          &container.Config{},
+		HostConfig:      &container.HostConfig{},
+		ImageEntrypoint: []string{"/bin/sh"},
+		RootPath:        "/rootfs",
+		Hostname:        "test",
+		NetworkMode:     "none",
+	})
+	if err != nil {
+		t.Fatalf("GenerateSpec: %v", err)
+	}
+
+	// None mode: should have a network namespace with empty path (crun creates new one).
+	assertNamespaces(t, spec.Linux.Namespaces, []ocispec.LinuxNamespaceType{
+		ocispec.PIDNamespace, ocispec.MountNamespace, ocispec.IPCNamespace, ocispec.UTSNamespace, ocispec.NetworkNamespace,
+	})
+
+	for _, ns := range spec.Linux.Namespaces {
+		if ns.Type == ocispec.NetworkNamespace && ns.Path != "" {
+			t.Errorf("none mode network namespace should have empty path, got %q", ns.Path)
+		}
+	}
+}
+
+func TestGenerateSpec_ContainerNetworkMode(t *testing.T) {
+	t.Parallel()
+
+	nsPath := "/proc/12345/ns/net"
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config:          &container.Config{},
+		HostConfig:      &container.HostConfig{},
+		ImageEntrypoint: []string{"/bin/sh"},
+		RootPath:        "/rootfs",
+		Hostname:        "test",
+		NetworkMode:     "container:abc123",
+		NetworkNSPath:   nsPath,
+	})
+	if err != nil {
+		t.Fatalf("GenerateSpec: %v", err)
+	}
+
+	// container: mode should have a network namespace with the target's ns path.
+	var found bool
+
+	for _, ns := range spec.Linux.Namespaces {
+		if ns.Type == ocispec.NetworkNamespace {
+			found = true
+
+			if ns.Path != nsPath {
+				t.Errorf("network namespace path = %q, want %q", ns.Path, nsPath)
+			}
+		}
+	}
+
+	if !found {
+		t.Error("container mode should have a network namespace")
+	}
+}
+
+func TestGenerateSpec_ExtraBindMounts(t *testing.T) {
+	t.Parallel()
+
+	extraMounts := []ocispec.Mount{
+		{
+			Destination: "/etc/hostname",
+			Type:        "bind",
+			Source:      "/tmp/hostname",
+			Options:     []string{"rbind", "rprivate", "rw"},
+		},
+		{
+			Destination: "/etc/hosts",
+			Type:        "bind",
+			Source:      "/tmp/hosts",
+			Options:     []string{"rbind", "rprivate", "rw"},
+		},
+	}
+
+	spec, err := GenerateSpec(&SpecOpts{
+		Config:          &container.Config{},
+		HostConfig:      &container.HostConfig{},
+		ImageEntrypoint: []string{"/bin/sh"},
+		RootPath:        "/rootfs",
+		Hostname:        "test",
+		ExtraBindMounts: extraMounts,
+	})
+	if err != nil {
+		t.Fatalf("GenerateSpec: %v", err)
+	}
+
+	// Verify extra mounts are present.
+	mountDests := make(map[string]bool)
+	for _, m := range spec.Mounts {
+		mountDests[m.Destination] = true
+	}
+
+	if !mountDests["/etc/hostname"] {
+		t.Error("missing /etc/hostname bind mount")
+	}
+
+	if !mountDests["/etc/hosts"] {
+		t.Error("missing /etc/hosts bind mount")
+	}
 }
