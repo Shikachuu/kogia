@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -440,25 +441,20 @@ func logMaxFiles(record *container.InspectResponse) int {
 }
 
 // writeStdcopyFrame writes a Docker stdcopy multiplexed frame.
+// Format: [stream_type, 0, 0, 0, size(4 bytes big-endian)] + payload.
 func writeStdcopyFrame(w http.ResponseWriter, msg *clog.Message) {
-	// stdout = 1, stderr = 2.
-	streamType := byte(1)
+	streamType := byte(1) // stdout
 	if msg.Stream == "stderr" {
 		streamType = 2
 	}
 
-	payload := msg.Line
+	var header [8]byte
 
-	// stdcopy header: [stream_type, 0, 0, 0, size(4 bytes big-endian)].
-	header := [8]byte{streamType}
-	size := uint32(len(payload)) //nolint:gosec // Log line length is bounded by scanner buffer size.
-	header[4] = byte(size >> 24)
-	header[5] = byte(size >> 16) //nolint:gosec // Byte truncation is intentional for big-endian encoding.
-	header[6] = byte(size >> 8)  //nolint:gosec // Byte truncation is intentional for big-endian encoding.
-	header[7] = byte(size)       //nolint:gosec // Byte truncation is intentional for big-endian encoding.
+	header[0] = streamType
+	binary.BigEndian.PutUint32(header[4:8], uint32(len(msg.Line))) //nolint:gosec // Log line length is bounded by scanner buffer size.
 
-	_, _ = w.Write(header[:]) //nolint:gosec // Response writer errors are handled by the HTTP server.
-	_, _ = w.Write(payload)   //nolint:gosec // Response writer errors are handled by the HTTP server.
+	_, _ = w.Write(header[:])
+	_, _ = w.Write(msg.Line) //nolint:gosec // Response writer errors are handled by the HTTP server.
 }
 
 // inspectToSummary converts an InspectResponse to a container Summary for listing.

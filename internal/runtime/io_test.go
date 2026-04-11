@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -12,6 +13,27 @@ import (
 
 	clog "github.com/Shikachuu/kogia/internal/log"
 )
+
+// expectStdcopy builds the expected stdcopy-framed output for non-TTY attach tests.
+func expectStdcopy(stream string, lines ...string) []byte {
+	streamType := byte(1)
+	if stream == "stderr" {
+		streamType = 2
+	}
+
+	var buf bytes.Buffer
+
+	for _, line := range lines {
+		var hdr [8]byte
+
+		hdr[0] = streamType
+		binary.BigEndian.PutUint32(hdr[4:], uint32(len(line)))
+		buf.Write(hdr[:])
+		buf.WriteString(line)
+	}
+
+	return buf.Bytes()
+}
 
 // mockDriver collects log messages for testing.
 type mockDriver struct {
@@ -418,10 +440,10 @@ func TestContainerIO_AttachWriter(t *testing.T) {
 		t.Fatalf("expected 2 log lines, got %d", len(lines))
 	}
 
-	// Verify attach writer received data.
-	got := attachBuf.String()
-	if got != "hello\nworld\n" {
-		t.Errorf("attach writer: got %q, want %q", got, "hello\nworld\n")
+	// Verify attach writer received stdcopy-framed data.
+	want := expectStdcopy("stdout", "hello\n", "world\n")
+	if !bytes.Equal(attachBuf.Bytes(), want) {
+		t.Errorf("attach writer: got %q, want %q", attachBuf.Bytes(), want)
 	}
 }
 
@@ -450,12 +472,14 @@ func TestContainerIO_MultipleAttachWriters(t *testing.T) {
 
 	_ = r.Close()
 
-	if buf1.String() != "data\n" {
-		t.Errorf("writer 1: got %q, want %q", buf1.String(), "data\n")
+	want := expectStdcopy("stdout", "data\n")
+
+	if !bytes.Equal(buf1.Bytes(), want) {
+		t.Errorf("writer 1: got %q, want %q", buf1.Bytes(), want)
 	}
 
-	if buf2.String() != "data\n" {
-		t.Errorf("writer 2: got %q, want %q", buf2.String(), "data\n")
+	if !bytes.Equal(buf2.Bytes(), want) {
+		t.Errorf("writer 2: got %q, want %q", buf2.Bytes(), want)
 	}
 }
 
@@ -493,5 +517,189 @@ func TestContainerIO_RemoveAttachWriter(t *testing.T) {
 	// Log driver should still have data.
 	if len(driver.lines()) != 1 {
 		t.Errorf("expected 1 log line, got %d", len(driver.lines()))
+	}
+}
+
+func TestCopyStream_BuffersWhenNoWriters(t *testing.T) {
+	t.Parallel()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	driver := &mockDriver{}
+	cio := &containerIO{driver: driver}
+	cio.wg.Add(1)
+
+	go cio.copyStream(r, "stdout")
+
+	_, _ = w.WriteString("hello\nworld\n")
+	_ = w.Close()
+
+	cio.wg.Wait()
+
+	_ = r.Close()
+
+	// Output should be buffered with stdcopy framing since no writers were registered.
+	cio.mu.Lock()
+	got := cio.attachBuf
+	cio.mu.Unlock()
+
+	want := expectStdcopy("stdout", "hello\n", "world\n")
+	if !bytes.Equal(got, want) {
+		t.Errorf("attachBuf: got %q, want %q", got, want)
+	}
+
+	// Log driver should still receive all lines.
+	lines := driver.lines()
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 log lines, got %d: %v", len(lines), lines)
+	}
+}
+
+func TestCopyStream_LateAttachReplay(t *testing.T) {
+	t.Parallel()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	driver := &mockDriver{}
+	cio := &containerIO{driver: driver}
+	cio.wg.Add(1)
+
+	go cio.copyStream(r, "stdout")
+
+	_, _ = w.WriteString("hello\nworld\n")
+	_ = w.Close()
+
+	cio.wg.Wait()
+
+	_ = r.Close()
+
+	// Register a writer after copyStream has finished — should replay buffer.
+	var buf bytes.Buffer
+	cio.AddAttachWriter(&buf)
+
+	want := expectStdcopy("stdout", "hello\n", "world\n")
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Errorf("late attach: got %q, want %q", buf.Bytes(), want)
+	}
+
+	// Buffer should be flushed.
+	cio.mu.Lock()
+	if cio.attachBuf != nil {
+		t.Errorf("attachBuf should be nil after flush, got %q", string(cio.attachBuf))
+	}
+
+	if !cio.attachBufFlushed {
+		t.Error("attachBufFlushed should be true")
+	}
+	cio.mu.Unlock()
+}
+
+func TestCopyStream_BufferStopsAfterFirstWriter(t *testing.T) {
+	t.Parallel()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	driver := &mockDriver{}
+	cio := &containerIO{driver: driver}
+	cio.wg.Add(1)
+
+	go cio.copyStream(r, "stdout")
+
+	// Write first line — will be buffered (no writers yet).
+	_, _ = w.WriteString("before\n")
+
+	// Give copyStream time to read and buffer.
+	time.Sleep(50 * time.Millisecond)
+
+	// Register writer — should replay "before\n".
+	var buf bytes.Buffer
+	cio.AddAttachWriter(&buf)
+
+	// Write second line — should go directly to writer, not buffer.
+	_, _ = w.WriteString("after\n")
+	_ = w.Close()
+
+	cio.wg.Wait()
+
+	_ = r.Close()
+
+	want := append(expectStdcopy("stdout", "before\n"), expectStdcopy("stdout", "after\n")...)
+	if !bytes.Equal(buf.Bytes(), want) {
+		t.Errorf("attach writer: got %q, want %q", buf.Bytes(), want)
+	}
+
+	// No further buffering should occur.
+	cio.mu.Lock()
+	if cio.attachBuf != nil {
+		t.Errorf("attachBuf should be nil, got %q", string(cio.attachBuf))
+	}
+	cio.mu.Unlock()
+}
+
+func TestCopyStream_BothStreamsBuffer(t *testing.T) {
+	t.Parallel()
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	driver := &mockDriver{}
+	cio := &containerIO{driver: driver}
+	cio.wg.Add(2)
+
+	go cio.copyStream(stdoutR, "stdout")
+	go cio.copyStream(stderrR, "stderr")
+
+	_, _ = stdoutW.WriteString("out\n")
+	_, _ = stderrW.WriteString("err\n")
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+
+	cio.wg.Wait()
+
+	_ = stdoutR.Close()
+	_ = stderrR.Close()
+
+	// Both streams share attachBuf — verify all output is buffered with framing.
+	cio.mu.Lock()
+	got := cio.attachBuf
+	cio.mu.Unlock()
+
+	stdoutFrame := expectStdcopy("stdout", "out\n")
+	stderrFrame := expectStdcopy("stderr", "err\n")
+
+	if !bytes.Contains(got, stdoutFrame) {
+		t.Errorf("attachBuf missing stdout frame, got %q", got)
+	}
+
+	if !bytes.Contains(got, stderrFrame) {
+		t.Errorf("attachBuf missing stderr frame, got %q", got)
+	}
+
+	// Late attach should replay everything.
+	var buf bytes.Buffer
+	cio.AddAttachWriter(&buf)
+
+	if !bytes.Contains(buf.Bytes(), stdoutFrame) {
+		t.Errorf("late attach missing stdout frame, got %q", buf.Bytes())
+	}
+
+	if !bytes.Contains(buf.Bytes(), stderrFrame) {
+		t.Errorf("late attach missing stderr frame, got %q", buf.Bytes())
 	}
 }

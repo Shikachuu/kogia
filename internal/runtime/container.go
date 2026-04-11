@@ -56,6 +56,7 @@ type Manager struct {
 	active       map[string]*activeContainer
 	pidMap       map[int]string
 	execSessions map[string]*ExecSession
+	startNotify  map[string]chan struct{} // closed when container enters active map
 	bundleRoot   string
 	mu           sync.Mutex
 	execMu       sync.Mutex
@@ -98,6 +99,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		active:       make(map[string]*activeContainer),
 		pidMap:       make(map[int]string),
 		execSessions: make(map[string]*ExecSession),
+		startNotify:  make(map[string]chan struct{}),
 	}
 }
 
@@ -583,6 +585,13 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 
 	m.active[record.ID] = ac
 	m.pidMap[pid] = record.ID
+
+	// Wake any Attach callers waiting for this container to start.
+	if ch, ok := m.startNotify[record.ID]; ok {
+		close(ch)
+		delete(m.startNotify, record.ID)
+	}
+
 	m.mu.Unlock()
 
 	// Start live OOM monitoring via inotify.
@@ -768,6 +777,12 @@ func (m *Manager) Remove(ctx context.Context, id string, force bool) error {
 	if delErr := m.store.DeleteContainer(record.ID, record.Name); delErr != nil {
 		return fmt.Errorf("runtime: delete from store: %w", delErr)
 	}
+
+	// Clean up active map and startNotify entries.
+	m.mu.Lock()
+	delete(m.active, record.ID)
+	delete(m.startNotify, record.ID)
+	m.mu.Unlock()
 
 	slog.Info("container removed", "id", record.ID[:12])
 
@@ -962,7 +977,6 @@ func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 
 	ac := m.active[containerID]
 	delete(m.pidMap, pid)
-	delete(m.active, containerID)
 	m.mu.Unlock()
 
 	slog.Info("container exited", "id", containerID[:12], "pid", pid, "exitCode", exitCode)
@@ -1021,6 +1035,10 @@ func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 	if ac != nil {
 		close(ac.done)
 	}
+
+	// NOTE: We intentionally do NOT delete from m.active here. The entry
+	// must remain so that Attach can still find the activeContainer and
+	// flush buffered output via AddAttachWriter. Cleaned up by Remove().
 
 	// Handle auto-remove.
 	if record.HostConfig != nil && record.HostConfig.AutoRemove {
@@ -1214,7 +1232,7 @@ type AttachOpts struct {
 // Attach connects a client to a running container's stdio.
 // It blocks until the container exits or the client disconnects.
 //
-//nolint:gocognit,gocyclo // Attach manages complex bidirectional streaming with polling.
+//nolint:gocognit,gocyclo // Attach manages bidirectional streaming with channel-based synchronization.
 func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error {
 	// Wait for the container to appear in the active map (Docker CLI sends
 	// attach before start for `docker run`).
@@ -1223,11 +1241,21 @@ func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error
 	for {
 		m.mu.Lock()
 		ac = m.active[id]
-		m.mu.Unlock()
 
 		if ac != nil {
+			m.mu.Unlock()
+
 			break
 		}
+
+		// Get or create a notification channel for this container.
+		ch := m.startNotify[id]
+		if ch == nil {
+			ch = make(chan struct{})
+			m.startNotify[id] = ch
+		}
+
+		m.mu.Unlock()
 
 		record, err := m.store.GetContainer(id)
 		if err != nil {
@@ -1239,7 +1267,7 @@ func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error
 		}
 
 		select {
-		case <-time.After(WaitPollInterval):
+		case <-ch:
 		case <-ctx.Done():
 			return fmt.Errorf("runtime: attach canceled: %w", ctx.Err())
 		}
@@ -1252,6 +1280,8 @@ func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error
 	}
 
 	// Forward stdin from client to container.
+	// Channel stays open (nil-like) when stdin is not requested, so the
+	// select below only unblocks on ac.done or ctx.Done.
 	stdinDone := make(chan struct{})
 
 	if opts.Stdin {
@@ -1273,8 +1303,6 @@ func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error
 				}
 			}
 		}()
-	} else {
-		close(stdinDone)
 	}
 
 	// Block until container exits or client disconnects.

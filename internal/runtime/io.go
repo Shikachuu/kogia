@@ -3,6 +3,7 @@ package runtime
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -137,17 +138,7 @@ func (cio *containerIO) copyStreamRaw(r *os.File, stream string) {
 			chunk := buf[:n]
 
 			// Send raw bytes to attach writers, or buffer if none registered yet.
-			cio.mu.Lock()
-			if len(cio.attachOut) == 0 && !cio.attachBufFlushed {
-				cio.attachBuf = append(cio.attachBuf, chunk...)
-			} else {
-				for _, w := range cio.attachOut {
-					if _, wErr := w.Write(chunk); wErr != nil {
-						slog.Debug("attach writer error", "stream", stream, "err", wErr)
-					}
-				}
-			}
-			cio.mu.Unlock()
+			cio.fanOutOrBuffer(chunk, stream)
 
 			// Accumulate into lines for the log driver.
 			lineBuf = append(lineBuf, chunk...)
@@ -224,14 +215,8 @@ func (cio *containerIO) copyStream(r *os.File, stream string) {
 				slog.Error("log driver write error", "stream", stream, "err", logErr)
 			}
 
-			// Fan out to attached writers.
-			cio.mu.Lock()
-			for _, w := range cio.attachOut {
-				if _, wErr := w.Write(line); wErr != nil {
-					slog.Debug("attach writer error", "stream", stream, "err", wErr)
-				}
-			}
-			cio.mu.Unlock()
+			// Fan out to attached writers, or buffer if none registered yet.
+			cio.fanOutOrBuffer(line, stream)
 		}
 
 		if err != nil {
@@ -242,6 +227,49 @@ func (cio *containerIO) copyStream(r *os.File, stream string) {
 			break
 		}
 	}
+}
+
+// fanOutOrBuffer sends data to attached writers, or buffers it if none are
+// registered yet. Used by both copyStream and copyStreamRaw.
+// For non-TTY containers, data is wrapped in Docker stdcopy framing so the
+// Docker CLI can demultiplex stdout/stderr.
+func (cio *containerIO) fanOutOrBuffer(data []byte, stream string) {
+	cio.mu.Lock()
+	defer cio.mu.Unlock()
+
+	// For non-TTY, wrap with stdcopy header so Docker CLI can parse the stream.
+	out := data
+	if !cio.tty {
+		out = stdcopyFrame(stream, data)
+	}
+
+	if len(cio.attachOut) == 0 && !cio.attachBufFlushed {
+		cio.attachBuf = append(cio.attachBuf, out...)
+
+		return
+	}
+
+	for _, w := range cio.attachOut {
+		if _, wErr := w.Write(out); wErr != nil {
+			slog.Debug("attach writer error", "stream", stream, "err", wErr)
+		}
+	}
+}
+
+// stdcopyFrame wraps data in a Docker stdcopy multiplexed frame.
+// Format: [stream_type, 0, 0, 0, size(4 bytes big-endian)] + payload.
+func stdcopyFrame(stream string, data []byte) []byte {
+	streamType := byte(1) // stdout
+	if stream == "stderr" {
+		streamType = 2
+	}
+
+	frame := make([]byte, 8+len(data))
+	frame[0] = streamType
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(data))) //nolint:gosec // Line length is bounded by scanner buffer size.
+	copy(frame[8:], data)
+
+	return frame
 }
 
 // WriterFds returns the file descriptors to pass to crun as stdout and stderr.
@@ -263,8 +291,8 @@ func (cio *containerIO) MarkWritersClosed() {
 }
 
 // AddAttachWriter registers a writer that will receive container output.
-// For non-TTY containers the caller should wrap with stdcopy framing.
-// If there's buffered early output (TTY mode), it's flushed to the new writer.
+// For non-TTY containers, output is automatically wrapped with stdcopy framing.
+// If there's buffered early output, it's flushed to the new writer.
 func (cio *containerIO) AddAttachWriter(w io.Writer) {
 	cio.mu.Lock()
 	defer cio.mu.Unlock()

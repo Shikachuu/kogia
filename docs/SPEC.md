@@ -40,24 +40,24 @@ Official Docker CLI / docker compose / docker buildx
 
 ## Key Decisions
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| OCI runtime | crun (fork/exec) | Battle-tested (Podman/CRI-O), no daemon RSS cost per container |
-| Docker API types | moby/moby/api types directly (no generation) | Identical to Docker's own types — zero drift risk. Handlers import from `github.com/moby/moby/api/types/*` sub-packages. |
-| HTTP routing | Custom generator (`hack/gen-routes`) from Docker's Swagger 2.0 spec | Reads spec with `go-openapi/loads`, emits `Handler` interface + `RegisterRoutes()` + `NotImplemented` struct using stdlib `net/http.ServeMux`. Compile-time handler contracts — missing methods won't compile. Streaming/hijack endpoints get correct `http.ResponseWriter` signatures (unlike go-swagger/oapi-codegen). Update = download new swagger.yaml → regenerate. |
-| Docker streaming helpers | moby stdcopy + jsonfilelog (imported) | Streaming protocols (attach, logs, exec) aren't well-modeled in Swagger. Import moby's battle-tested implementations for these. |
-| Image management | containers/image + containers/storage | Full Podman-grade stack. Handles registry auth, layer extraction, overlayfs whiteouts, all storage driver complexity |
-| Rootfs | containers/storage Mount/Unmount | No hand-rolled overlayfs |
-| State | bbolt (go.etcd.io/bbolt) | Pure Go, no CGo, proven (etcd/Kubernetes). Single-writer but sufficient. |
-| Networking | vishvananda/netlink + google/nftables + miekg/dns (in-process) | Fully in-process, no external binaries. internal/network/ |
-| DNS | miekg/dns authoritative server on bridge gateway IP | Dynamic updates as containers join/leave. resolv.conf points containers here |
-| BuildKit | docker-container buildx driver | Builds use `docker buildx` with the docker-container driver, which manages its own buildkitd container. No in-daemon build subprocess. |
-| Container supervision | In-daemon goroutine per container | Subreaper + SIGCHLD reaper collects exit codes, manages stdio, updates bbolt. Exit codes persisted to `exitcode` file for crash recovery. Live OOM detection via inotify watch on cgroup v2 `memory.events` (with post-mortem fallback). Dynamically resolved cgroup path. Daemon protected from OOM killer (`oom_score_adj=-1000`). |
-| Live-restore | Deferred to v2 | Daemon shutdown stops all containers. Simpler v1. |
-| Interface | Docker API only (Unix socket) | No MCP. `DOCKER_HOST=unix:///run/kogia.sock` |
-| CGo | Not required | bbolt is pure Go. containers/storage overlay driver uses pure Go. crun is external binary. |
-| Logging | log/slog (stdlib) | Structured JSON, zero deps, zero overhead. Forward-looking (all major runtimes use logrus but are considering migration to slog). |
-| Metrics | Prometheus, opt-in | Off by default. `--metrics-addr=:9090` to enable. When off: 0 MB overhead, no listener, no middleware. When on: +2-3 MB RSS, ~2μs/req. Custom container lifecycle metrics added manually. |
+| Decision                 | Choice                                                              | Rationale                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------ | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| OCI runtime              | crun (fork/exec)                                                    | Battle-tested (Podman/CRI-O), no daemon RSS cost per container                                                                                                                                                                                                                                                                                                            |
+| Docker API types         | moby/moby/api types directly (no generation)                        | Identical to Docker's own types — zero drift risk. Handlers import from `github.com/moby/moby/api/types/*` sub-packages.                                                                                                                                                                                                                                                  |
+| HTTP routing             | Custom generator (`hack/gen-routes`) from Docker's Swagger 2.0 spec | Reads spec with `go-openapi/loads`, emits `Handler` interface + `RegisterRoutes()` + `NotImplemented` struct using stdlib `net/http.ServeMux`. Compile-time handler contracts — missing methods won't compile. Streaming/hijack endpoints get correct `http.ResponseWriter` signatures (unlike go-swagger/oapi-codegen). Update = download new swagger.yaml → regenerate. |
+| Docker streaming helpers | moby stdcopy + jsonfilelog (imported)                               | Streaming protocols (attach, logs, exec) aren't well-modeled in Swagger. Import moby's battle-tested implementations for these.                                                                                                                                                                                                                                           |
+| Image management         | containers/image + containers/storage                               | Full Podman-grade stack. Handles registry auth, layer extraction, overlayfs whiteouts, all storage driver complexity                                                                                                                                                                                                                                                      |
+| Rootfs                   | containers/storage Mount/Unmount                                    | No hand-rolled overlayfs                                                                                                                                                                                                                                                                                                                                                  |
+| State                    | bbolt (go.etcd.io/bbolt)                                            | Pure Go, no CGo, proven (etcd/Kubernetes). Single-writer but sufficient.                                                                                                                                                                                                                                                                                                  |
+| Networking               | vishvananda/netlink + google/nftables + miekg/dns (in-process)      | Fully in-process, no external binaries. internal/network/                                                                                                                                                                                                                                                                                                                 |
+| DNS                      | miekg/dns authoritative server on bridge gateway IP                 | Dynamic updates as containers join/leave. resolv.conf points containers here                                                                                                                                                                                                                                                                                              |
+| BuildKit                 | docker-container buildx driver                                      | Builds use `docker buildx` with the docker-container driver, which manages its own buildkitd container. No in-daemon build subprocess.                                                                                                                                                                                                                                    |
+| Container supervision    | In-daemon goroutine per container                                   | Subreaper + SIGCHLD reaper collects exit codes, manages stdio, updates bbolt. Exit codes persisted to `exitcode` file for crash recovery. Live OOM detection via inotify watch on cgroup v2 `memory.events` (with post-mortem fallback). Dynamically resolved cgroup path. Daemon protected from OOM killer (`oom_score_adj=-1000`).                                      |
+| Live-restore             | Deferred to v2                                                      | Daemon shutdown stops all containers. Simpler v1.                                                                                                                                                                                                                                                                                                                         |
+| Interface                | Docker API only (Unix socket)                                       | No MCP. `DOCKER_HOST=unix:///run/kogia.sock`                                                                                                                                                                                                                                                                                                                              |
+| CGo                      | Not required                                                        | bbolt is pure Go. containers/storage overlay driver uses pure Go. crun is external binary.                                                                                                                                                                                                                                                                                |
+| Logging                  | log/slog (stdlib)                                                   | Structured JSON, zero deps, zero overhead. Forward-looking (all major runtimes use logrus but are considering migration to slog).                                                                                                                                                                                                                                         |
+| Metrics                  | Prometheus, opt-in                                                  | Off by default. `--metrics-addr=:9090` to enable. When off: 0 MB overhead, no listener, no middleware. When on: +2-3 MB RSS, ~2μs/req. Custom container lifecycle metrics added manually.                                                                                                                                                                                 |
 
 ---
 
@@ -77,6 +77,7 @@ internal/api/gen/routes.go
 Docker API types come directly from `github.com/moby/moby/api/types/*` — the same types Docker itself uses. Handlers import from moby's sub-packages (`types/system`, `types/container`, etc.) and encode/decode JSON themselves.
 
 The custom generator (`hack/gen-routes/main.go`) was chosen over go-swagger and oapi-codegen because:
+
 - **Streaming endpoints** (attach, exec, logs, events) use HTTP hijacking that can't be modeled in OpenAPI. go-swagger/oapi-codegen produce wrong handler signatures for these. Our generator emits standard `(http.ResponseWriter, *http.Request)` — handlers can hijack as needed.
 - **go-swagger's generated models** conflict with moby's types (`x-go-type` extensions, inline schema extraction, validation interfaces). Using moby types directly eliminates all compatibility issues.
 - **Moby's own OpenAPI 3.0 migration** (PR #51565) is still unmerged after 4+ months, confirming spec conversion is non-trivial.
@@ -198,6 +199,7 @@ golang.org/x/sys                      # Linux syscalls
 ```
 
 ### Build-time tools (not Go dependencies)
+
 ```
 github.com/go-openapi/loads           # used by hack/gen-routes to parse swagger.yaml at generation time
 ```
@@ -233,30 +235,32 @@ github.com/go-openapi/loads           # used by hack/gen-routes to parse swagger
 ## Observability
 
 ### Logging
+
 `log/slog` (Go stdlib). Structured JSON output. Configurable via `--log-level` (debug, info, warn, error).
 
 ### Metrics (opt-in via `--metrics-addr=:9090`)
 
 Following CRI-O's patterns (manual Prometheus, operation-level labels):
 
-| Metric | Type | Labels |
-|---|---|---|
+| Metric                               | Type      | Labels                                                  |
+| ------------------------------------ | --------- | ------------------------------------------------------- |
 | `kogia_container_operations_seconds` | Histogram | `operation` = {create, start, stop, kill, remove, exec} |
-| `kogia_container_operations_total` | Counter | `operation`, `status` = {success, error} |
-| `kogia_container_states` | Gauge | `state` = {running, paused, stopped, created} |
-| `kogia_api_request_duration_seconds` | Histogram | `operation` (from go-swagger handler name) |
-| `kogia_api_requests_total` | Counter | `operation`, `code` |
-| `kogia_image_pull_duration_seconds` | Histogram | — |
-| `kogia_image_pull_bytes_total` | Counter | — |
-| `kogia_image_pulls_total` | Counter | `status` = {success, error} |
-| `kogia_network_operations_seconds` | Histogram | `operation` = {connect, disconnect, create, remove} |
-| `kogia_containers_oom_total` | Counter | — |
+| `kogia_container_operations_total`   | Counter   | `operation`, `status` = {success, error}                |
+| `kogia_container_states`             | Gauge     | `state` = {running, paused, stopped, created}           |
+| `kogia_api_request_duration_seconds` | Histogram | `operation` (from go-swagger handler name)              |
+| `kogia_api_requests_total`           | Counter   | `operation`, `code`                                     |
+| `kogia_image_pull_duration_seconds`  | Histogram | —                                                       |
+| `kogia_image_pull_bytes_total`       | Counter   | —                                                       |
+| `kogia_image_pulls_total`            | Counter   | `status` = {success, error}                             |
+| `kogia_network_operations_seconds`   | Histogram | `operation` = {connect, disconnect, create, remove}     |
+| `kogia_containers_oom_total`         | Counter   | —                                                       |
 
 The go-swagger middleware handles `kogia_api_*` automatically (semantic operation names from generated handler names). Container/image/network lifecycle metrics are manual (~50-70 LOC).
 
 When `--metrics-addr` is not set: zero overhead, no listener, no middleware registration.
 
 ### Tracing
+
 Deferred to v2. Not needed for standalone Docker replacement. Can add OTel behind a flag later if kogia is used in orchestrated environments.
 
 ---
@@ -264,9 +268,11 @@ Deferred to v2. Not needed for standalone Docker replacement. Can add OTel behin
 ## Implementation Phases
 
 ### Phase 0: Skeleton ✅
+
 **Goal:** `docker version`, `docker info`, `docker ps` work.
 
 **Implemented:**
+
 - `go.mod`, `mise.toml` (Go 1.26.1, golangci-lint, goreleaser, trivy, yq — build task injects Docker API version from swagger spec via ldflags)
 - `api/swagger.yaml` — Docker's swagger.yaml (API v1.54), downloaded from moby/moby via `hack/download-swagger.sh` (version derived from `github.com/moby/moby/v2` in go.mod)
 - `hack/gen-routes/main.go` — custom code generator reads swagger spec with `go-openapi/loads`, emits `internal/api/gen/routes.go` with 107 operations (Handler interface + RegisterRoutes + NotImplemented). Regenerate with `mise run gogen`.
@@ -283,6 +289,7 @@ Deferred to v2. Not needed for standalone Docker replacement. Can add OTel behin
 **Note on version prefix:** Docker CLI sends requests like `/v1.47/containers/json`. Middleware rewrites any `/v{version}/` prefix to the basePath from the swagger spec (`/v1.54/`) before dispatching to the `ServeMux`. Bare `/_ping` is also handled.
 
 **Verify:**
+
 ```bash
 mise run build && mise run dev &
 export DOCKER_HOST=unix://$(pwd)/bin/.kogia-dev/run/kogia.sock
@@ -292,9 +299,11 @@ docker version && docker info && docker ps
 ---
 
 ### Phase 1: Image Management ✅
+
 **Goal:** Full image lifecycle — pull, list, inspect, tag, remove, history, prune, search, save/load, push.
 
 **Implemented:**
+
 - `internal/image/store.go` — containers/storage wrapper. Configurable driver via `StorageDriver` type (overlay, vfs, fuse-overlayfs). `List()`, `Get()`, `Remove()`, `Tag()`, `History()`, `Prune()`. OCI config parsing for inspect (architecture, rootfs, labels, config). Image name resolution with normalization (`alpine` → `docker.io/library/alpine:latest`).
 - `internal/image/pull.go` — `copy.Image()` from docker transport → storage transport. NDJSON progress streaming via `progressWriter` (wraps `containers/image` text into `{"status":"..."}` lines, flushes via `http.Flusher`). In-band error reporting for streaming responses.
 - `internal/image/push.go` — Push from local storage to docker registry. Auth support, NDJSON progress streaming. Resolves name+tag for images where CLI sends them separately.
@@ -327,6 +336,7 @@ docker version && docker info && docker ps
 **Dependencies added:** `containers/image/v5`, `containers/storage`
 
 **Verify:**
+
 ```bash
 docker pull hello-world && docker pull alpine:latest
 docker images                    # lists both
@@ -344,16 +354,18 @@ docker image prune               # remove dangling images
 ---
 
 ### Phase 2: Container Run ✅
+
 **Goal:** `docker run --rm hello-world` prints output and exits.
 
 **Implemented:**
+
 - `internal/runtime/crun.go` — `CrunConfig` struct (BinaryPath + RootDir). `run()` generic command executor appends `--root` flag, captures stderr. `createWithIO()` runs `crun create --bundle --pid-file` passing stdout/stderr `*os.File` directly (not wrappers) to avoid internal pipe + goroutine leak. `start()`, `kill()` (targets init PID), `killAll()` (passes `--all` to signal all processes in the container's cgroup — used by Stop()), `deleteContainer()` (with `--force`). All commands have 30s timeout.
 - `internal/runtime/spec.go` — `GenerateSpec()` produces OCI 1.2.0 spec from Docker config. Merges entrypoint + cmd per Docker precedence rules. Builds environment (image + container config), ensures PATH and HOSTNAME. User/group resolution via `/etc/passwd` and `/etc/group` in rootfs (`parseUser()`, `lookupUser()`, `lookupGroup()` — supports all Docker formats: uid, uid:gid, username, username:group). Sets default Linux capabilities (42 caps) or all for privileged. Resource limits (memory, CPU, PIDs). Default mounts: /proc, /dev, /dev/pts, /dev/shm, /dev/mqueue, /sys, /sys/fs/cgroup. Namespaces: PID, mount, IPC, UTS (no network yet — Phase 4). Cgroup path: `kogia/{hostname}`. Exported `BuildArgs()` helper for entrypoint + cmd merging.
-- `internal/runtime/container.go` — `Manager` struct with `active` map (tracks running containers), `pidMap` (container PID → ID), bundleRoot, store, images, crun references. `activeContainer` tracks ephemeral state: done channel, IO, PID, bundleDir (for persistent exit status), cgroupPath (dynamically resolved for OOM detection), manuallyStopped flag. **Create:** 32 random bytes → 64-char hex ID. Auto-generated Docker-style names ("adjective_scientist##") via `names.go`, or user-provided with `/` prefix. Resolves image, creates RW layer via containers/storage, mounts rootfs, generates OCI spec, writes config.json to bundle dir, persists `InspectResponse` to bbolt. **Start:** Mounts rootfs, updates spec root path, creates jsonfile log driver, creates stdio pipes, starts copy goroutines *before* `crun create` (deadlock prevention), reads PID from pid-file, resolves cgroup path from `/proc/{pid}/cgroup`, registers in `active`+`pidMap` *before* `crun start` (race prevention for instant-exit containers), updates bbolt state to "running", calls `crun start`. **Stop:** Sets `manuallyStopped` flag (prevents restart policy from firing), sends SIGTERM via `killAll` (signals all processes in container cgroup) with timeout, waits on `ac.done` channel, sends SIGKILL via `killAll` if timeout, cleans up crun state. **Kill:** Sends arbitrary signal to init PID only (matches Docker behavior). **Remove:** Stops if force, `crun delete`, unmounts rootfs, deletes storage container, removes bundle dir, removes from bbolt. **Restart:** Stop → Start. **Wait:** Handles "created" state by polling until active entry appears, blocks on `ac.done` channel, returns stored exit code. **Inspect/List:** Read from bbolt. **HandleExit:** Called by reaper — closes stdio/log driver, updates bbolt to exited, handles auto-remove and restart policies (exponential backoff: 100ms base, 2x multiplier, 1 min cap). **RecoverOrphans:** On startup, reads persistent `exitcode` file from bundle dir when available (real exit code + OOM status), falls back to synthetic exit code 137 if file is missing. Cleans up "created" containers entirely. **Shutdown:** Gracefully stops all containers (10s timeout).
+- `internal/runtime/container.go` — `Manager` struct with `active` map (tracks running containers), `pidMap` (container PID → ID), bundleRoot, store, images, crun references. `activeContainer` tracks ephemeral state: done channel, IO, PID, bundleDir (for persistent exit status), cgroupPath (dynamically resolved for OOM detection), manuallyStopped flag. **Create:** 32 random bytes → 64-char hex ID. Auto-generated Docker-style names ("adjective_scientist##") via `names.go`, or user-provided with `/` prefix. Resolves image, creates RW layer via containers/storage, mounts rootfs, generates OCI spec, writes config.json to bundle dir, persists `InspectResponse` to bbolt. **Start:** Mounts rootfs, updates spec root path, creates jsonfile log driver, creates stdio pipes, starts copy goroutines _before_ `crun create` (deadlock prevention), reads PID from pid-file, resolves cgroup path from `/proc/{pid}/cgroup`, registers in `active`+`pidMap` _before_ `crun start` (race prevention for instant-exit containers), updates bbolt state to "running", calls `crun start`. **Stop:** Sets `manuallyStopped` flag (prevents restart policy from firing), sends SIGTERM via `killAll` (signals all processes in container cgroup) with timeout, waits on `ac.done` channel, sends SIGKILL via `killAll` if timeout, cleans up crun state. **Kill:** Sends arbitrary signal to init PID only (matches Docker behavior). **Remove:** Stops if force, `crun delete`, unmounts rootfs, deletes storage container, removes bundle dir, removes from bbolt. **Restart:** Stop → Start. **Wait:** Handles "created" state by polling until active entry appears, blocks on `ac.done` channel, returns stored exit code. **Inspect/List:** Read from bbolt. **HandleExit:** Called by reaper — closes stdio/log driver, updates bbolt to exited, handles auto-remove and restart policies (exponential backoff: 100ms base, 2x multiplier, 1 min cap). **RecoverOrphans:** On startup, reads persistent `exitcode` file from bundle dir when available (real exit code + OOM status), falls back to synthetic exit code 137 if file is missing. Cleans up "created" containers entirely. **Shutdown:** Gracefully stops all containers (10s timeout).
 - `internal/runtime/io.go` — `containerIO` struct with stdout/stderr pipe pairs. `newContainerIO()` creates `os.Pipe()` pairs. `startCopyLoop()` launches 2 goroutines reading pipes → writing to jsonfile log driver. `copyStream()` uses `bufio.Reader.ReadBytes('\n')` with 64KB buffer — no hard line length limit, preserves final partial lines on EOF (appends newline), zero per-line allocation for complete lines. `WriterFds()` returns write FDs for crun. `MarkWritersClosed()` records that Start() closed write-ends after crun inherits them. `Close()` closes read-ends, waits for copy goroutines, closes log driver. `writersClosed` flag guards against double-close.
 - `internal/runtime/wait.go` — `SetSubreaper()` sets `PR_SET_CHILD_SUBREAPER` on daemon so orphaned container processes reparent to daemon. `StartReaper()` goroutine handles SIGCHLD via `signal.Notify`, calls `reapChildren()` on each signal. `reapChildren()` loops `unix.Wait4` to collect all exited children, extracts exit code (Exited vs Signaled paths), writes persistent `exitcode` file (exit code + OOM status) to bundle dir before calling `HandleExit()`, detects OOM kills via dynamically resolved cgroup v2 path (`resolveCgroupPath()` reads `/proc/{pid}/cgroup`). `readExitCodeFile()`/`writeExitCodeFile()` helpers for crash recovery.
 - `internal/runtime/defaults.go` — Constants: `DefaultStopTimeout=10s`, `DefaultStopSignal=SIGTERM`, `DefaultKillSignal=SIGKILL`, `RestartBackoffBase=100ms`, `RestartBackoffMultiplier=2`, `RestartBackoffMax=1min`, `WaitPollInterval=100ms`, `CrunOperationTimeout=30s`, `DefaultPathEnv`, `ContainerIDBytes=32`.
-- `internal/runtime/names.go` — `generateName()` returns Docker-style "adjective_scientist##" names (e.g., "jolly_curie42"). Falls back to `container_{random_hex}` after 10 failed attempts.
+- `internal/runtime/names.go` — `generateName()` returns Docker-style "adjective*scientist##" names (e.g., "jolly_curie42"). Falls back to `container*{random_hex}` after 10 failed attempts.
 - `internal/store/container.go` — Three bbolt buckets: `containers` (ID → JSON InspectResponse), `container_names` (name → ID), `container_bundles` (ID → bundle path). `CreateContainer()` checks name uniqueness. `GetContainer()` resolves by full ID, name (with or without `/` prefix — Docker stores names as `/foo` but CLI sends `foo`), or ID prefix (cursor-based, detects ambiguous prefixes). `UpdateContainer()`, `DeleteContainer()` (removes from all buckets). `ContainerNameExists()`. `SetContainerBundle()`/`GetContainerBundle()`. `ContainerFilters` struct supports Docker-style filtering by ID, Name, Status, Label, Ancestor, with Limit and All controls. `ListContainers()` applies all filters.
 - `internal/api/handlers/container.go` — All Phase 2 endpoints implemented:
   - `ContainerCreate` (POST /containers/create) — validates name/config/host config, calls runtime.Create(), returns ID + warnings
@@ -373,6 +385,7 @@ docker image prune               # remove dangling images
 - `internal/daemon/daemon.go` — Startup sequence extended: extract embedded crun binary, set subreaper, protect daemon from OOM killer (`oom_score_adj=-1000`), create `runtime.Manager` (crun binary path, crun root dir, bundle root, store + images), call `RecoverOrphans()`, start reaper goroutine. Shutdown: graceful server shutdown (5s timeout), graceful container shutdown (10s timeout).
 
 **Verify:**
+
 ```bash
 docker run --rm hello-world              # prints message, exits 0
 docker run -d --name ng nginx
@@ -385,9 +398,11 @@ docker run --rm alpine cat /etc/os-release
 ---
 
 ### Phase 3: Interactive + Exec + Live OOM ✅
+
 **Goal:** `docker run -it alpine sh`, `docker exec`, pause/unpause/top, and live OOM detection work.
 
 **Implemented:**
+
 - `internal/runtime/io.go` — `containerIO` extended to support three modes: non-TTY (stdout/stderr pipes), non-TTY with stdin (+ stdin pipe), and TTY (PTY master fd). Attach fan-out: registered `io.Writer`s receive container output in real time. Early output buffering for TTY mode — `copyStreamRaw` buffers output in `attachBuf` before the first attach writer registers, `AddAttachWriter` replays the buffer on connect (prevents losing the initial shell prompt). `WriteStdin()` writes to PTY master (TTY) or stdin pipe (non-TTY). `CloseStdin()` delivers EOF. `ResizePTY()` calls `TIOCSWINSZ` via `unix.IoctlSetWinsize`. Two copy modes: `copyStream` (line-buffered, for non-TTY — feeds log driver + attach writers) and `copyStreamRaw` (chunk-based, for TTY — raw bytes to attach writers for instant interactive echo, lines accumulated separately for log driver).
 - `internal/runtime/console.go` — `ReceivePTYMaster()`: listens on a Unix socket, accepts one connection, receives PTY master fd via SCM_RIGHTS using `conn.ReadMsgUnix` + `unix.ParseUnixRights`. Used by both container start and exec start for TTY mode. `resizePTY()`: sets terminal window size via `unix.IoctlSetWinsize`.
 - `internal/runtime/crun.go` — `createWithConsole()`: `crun create --console-socket=<path>` for TTY containers. `createWithIO()` extended with optional stdin `*os.File` parameter. `execCmd()`: returns unstarted `*exec.Cmd` for `crun exec --process=<file> <id>`. `execWithConsole()`: same with `--console-socket`. `pause()`/`resume()`: thin wrappers around `crun pause`/`crun resume`.
@@ -400,6 +415,7 @@ docker run --rm alpine cat /etc/os-release
 - `internal/api/handlers/exec.go` — `ContainerExec` (POST /containers/{id}/exec): decodes `ExecCreateRequest`, validates Cmd not empty, calls `ExecCreate`, responds with `ExecCreateResponse{ID}`. `ExecStart` (POST /exec/{id}/start): decodes `ExecStartRequest`, detached mode starts in background goroutine, interactive mode hijacks connection with 101 + upgrade headers, calls `ExecStart` with `context.Background()`. `ExecInspect` (GET /exec/{id}/json): returns `ExecInspectResponse`. `ExecResize` (POST /exec/{id}/resize): parses h/w, delegates to `ExecResize`.
 
 **Verify:**
+
 ```bash
 docker run -it --rm alpine sh            # interactive shell, exit
 docker run -i --rm alpine cat            # pipe stdin, Ctrl+D to EOF
@@ -420,10 +436,12 @@ docker rm -f oom
 
 ---
 
-### Phase 4: Networking (partially implemented)
+### Phase 4: Networking ✅
+
 **Goal:** Bridge networking, port mapping, DNS resolution, container-to-container communication.
 
 **Implemented:**
+
 - `internal/network/types.go` — `Record`, `EndpointRecord`, `PortMapping` types.
 - `internal/network/bridge.go` — `CreateBridge(name, gateway, subnet)` via netlink (idempotent, configures `ip_forward` + `route_localnet` sysctls on every call). `ConnectContainer(bridge, pid, containerIP, gateway, subnet)`: create veth pair with random temp names in host ns, move peer to container netns, rename to `eth0`, assign IP, set default route, attach host end to bridge. `DisconnectContainer(vethHost)`.
 - `internal/network/ipam.go` — per-subnet bitmap in bbolt `ipam` bucket. `Allocate(subnet) → IP`, `AllocateSpecific(subnet, ip)`, `Release(subnet, ip)`, `Count(subnet)`, `ReleaseSubnet(subnet)`. Skip .0 (network) and .1 (gateway). Bitmap scanning via `math/bits.TrailingZeros8`.
@@ -439,6 +457,7 @@ docker rm -f oom
 - **Modified** `internal/store/db.go` — registers 4 new bbolt buckets.
 
 **Verified:**
+
 ```bash
 docker run -d --name web -p 8080:80 nginx
 curl localhost:8080                              # ✅ nginx welcome page
@@ -463,9 +482,11 @@ docker network rm mynet                          # ✅ after disconnecting conta
 ---
 
 ### Phase 5: Volumes + Compose
+
 **Goal:** `docker compose up -d` with a multi-service stack works.
 
 **Create:**
+
 - `internal/volume/manager.go` — volumes at `/var/lib/kogia/volumes/{name}/_data/`. Create (mkdir + bbolt), Remove, Get, List.
 - `internal/store/volume.go` — bbolt CRUD
 - `internal/api/handlers/volume.go` — `GET /volumes`, `POST /volumes/create`, `GET /volumes/{name}`, `DELETE /volumes/{name}`, `POST /volumes/prune`
@@ -475,6 +496,7 @@ docker network rm mynet                          # ✅ after disconnecting conta
 - **Modify** `internal/runtime/container.go` — auto-create named volumes if they don't exist, handle `VolumesFrom`
 
 **Compose requirements** (all must work):
+
 - Container labels (com.docker.compose.project/service/container-number) — just regular labels
 - Label-filtered container list — `GET /containers/json?filters={"label":[...]}`
 - Network connect/disconnect per compose service
@@ -483,6 +505,7 @@ docker network rm mynet                          # ✅ after disconnecting conta
 - Pull before create
 
 **Verify:**
+
 ```bash
 docker volume create mydata
 docker run --rm -v mydata:/data alpine sh -c 'echo hello > /data/test.txt'
@@ -498,11 +521,13 @@ docker compose down -v
 ---
 
 ### Phase 6: Build + Remaining Image Endpoints ✅
+
 **Goal:** `docker buildx build` works via docker-container driver. All image endpoints implemented.
 
 **Architecture:** Modern Docker CLI (v28+) routes all builds through buildx. The docker-container driver creates and manages its own buildkitd container — no in-daemon build subprocess needed. This requires working container lifecycle (pull, create, start, exec) from earlier phases.
 
 **Implemented:**
+
 - `internal/api/handlers/build.go` — `ImageBuild`, `BuildPrune`, `Session` stubs return clear message directing users to the docker-container buildx driver.
 - `internal/api/handlers/commit.go` — `ImageCommit` (`POST /commit`): full implementation. Creates new image from container's RW layer with config overrides (Cmd, Entrypoint, Env, ExposedPorts, Volumes, WorkingDir, Labels, User). Uses containers/storage `Container()` → `Layer()` → `CreateImage()` + manifest/config big data.
 - `internal/image/commit.go` — `Store.Commit()`: clones base OCI config, applies overrides, appends new layer DiffID, creates image with manifest + config stored as big data.
@@ -510,6 +535,7 @@ docker compose down -v
 - `internal/image/inspect_remote.go` — `Store.DistributionInspect()`: uses containers/image to fetch manifest from registry, parses manifest lists for platform info.
 
 **Verify:**
+
 ```bash
 # Build (requires working container lifecycle for docker-container driver)
 docker buildx create --driver docker-container --name kogia --use
@@ -549,46 +575,46 @@ SIGTERM/SIGINT received →
 
 ## Estimated Memory (steady-state RSS)
 
-| Component | Estimate |
-|-----------|----------|
-| Go runtime | ~8 MB |
-| net/http (stdlib) | ~2 MB |
-| bbolt (mmap'd) | ~1-5 MB |
-| containers/storage (in-memory index) | ~5-10 MB |
-| Per-container (goroutine + pipes + metadata) | ~50 KB each |
-| DNS server (miekg/dns) | ~2 MB |
-| nftables client | ~1 MB |
-| Prometheus metrics (when enabled) | ~2-3 MB |
-| **Idle (0 containers, no metrics)** | **~25-35 MB** |
-| **Idle (0 containers, with metrics)** | **~28-38 MB** |
-| **50 containers** | **~50-65 MB** |
+| Component                                    | Estimate      |
+| -------------------------------------------- | ------------- |
+| Go runtime                                   | ~8 MB         |
+| net/http (stdlib)                            | ~2 MB         |
+| bbolt (mmap'd)                               | ~1-5 MB       |
+| containers/storage (in-memory index)         | ~5-10 MB      |
+| Per-container (goroutine + pipes + metadata) | ~50 KB each   |
+| DNS server (miekg/dns)                       | ~2 MB         |
+| nftables client                              | ~1 MB         |
+| Prometheus metrics (when enabled)            | ~2-3 MB       |
+| **Idle (0 containers, no metrics)**          | **~25-35 MB** |
+| **Idle (0 containers, with metrics)**        | **~28-38 MB** |
+| **50 containers**                            | **~50-65 MB** |
 
 ---
 
 ## Estimated Performance
 
-| Operation | Latency | Notes |
-|---|---|---|
-| Container create | ~8-15 ms | crun fork/exec + bbolt write |
-| Container start | ~15-30 ms | crun fork/exec |
-| Container exec | ~10-20 ms | crun fork/exec |
-| Container kill | ~3-5 ms | signal delivery |
-| API reads (list/inspect) | ~3-8 ms | bbolt scan |
-| User-perceived `docker run -d nginx` | ~0.5s | |
-| User-perceived `docker run --rm hello-world` | ~1.0s | includes image resolve + run + cleanup |
+| Operation                                    | Latency   | Notes                                  |
+| -------------------------------------------- | --------- | -------------------------------------- |
+| Container create                             | ~8-15 ms  | crun fork/exec + bbolt write           |
+| Container start                              | ~15-30 ms | crun fork/exec                         |
+| Container exec                               | ~10-20 ms | crun fork/exec                         |
+| Container kill                               | ~3-5 ms   | signal delivery                        |
+| API reads (list/inspect)                     | ~3-8 ms   | bbolt scan                             |
+| User-perceived `docker run -d nginx`         | ~0.5s     |                                        |
+| User-perceived `docker run --rm hello-world` | ~1.0s     | includes image resolve + run + cleanup |
 
 ---
 
 ## Comparison
 
-| | Docker | Podman (daemon) | containerd (raw) | **Kogia (Go)** |
-|---|---|---|---|---|
-| RSS (idle) | ~260 MB | ~50 MB | ~20 MB (+shims) | **~30 MB** |
-| RSS (50 containers) | ~400 MB | ~100 MB | ~240 MB (shims!) | **~55 MB** |
-| Docker CLI compat | 100% | ~92% | 0% (nerdctl ~85%) | **~97%** |
-| `docker compose` | 100% | ~90% | ~80% (nerdctl) | **~95%** |
-| Per-container overhead | shim (4 MB) | none | shim (4 MB) | **none** |
-| Maintenance burden | — | high (compat layer) | low | **low (generated API)** |
+|                        | Docker      | Podman (daemon)     | containerd (raw)  | **Kogia (Go)**          |
+| ---------------------- | ----------- | ------------------- | ----------------- | ----------------------- |
+| RSS (idle)             | ~260 MB     | ~50 MB              | ~20 MB (+shims)   | **~30 MB**              |
+| RSS (50 containers)    | ~400 MB     | ~100 MB             | ~240 MB (shims!)  | **~55 MB**              |
+| Docker CLI compat      | 100%        | ~92%                | 0% (nerdctl ~85%) | **~97%**                |
+| `docker compose`       | 100%        | ~90%                | ~80% (nerdctl)    | **~95%**                |
+| Per-container overhead | shim (4 MB) | none                | shim (4 MB)       | **none**                |
+| Maintenance burden     | —           | high (compat layer) | low               | **low (generated API)** |
 
 ---
 
@@ -604,11 +630,11 @@ SIGTERM/SIGINT received →
 
 ## Critical Risks & Mitigations
 
-| Risk | Impact | Mitigation |
-|---|---|---|
-| **Docker API fidelity** — undocumented CLI expectations beyond swagger spec | High | Custom route generator covers all 107 spec operations; moby types ensure response format matches Docker exactly; use socat traffic capture for undocumented behavior; golden-file tests |
-| **Streaming endpoints** — 4 protocols (logs, attach, pull progress, build session) | High | Import moby's stdcopy. Implement in order of difficulty. |
-| **spec.go complexity** — Docker→OCI config translation is ~800 LOC of edge cases | High | Start minimal (hello-world), expand iteratively. Extensive unit tests. |
-| **containers/storage edge cases** — whiteouts, opaque dirs, metacopy | Medium | Battle-tested library handles this. Trust it. |
-| **bbolt single-writer** — concurrent container creates queue on DB writes | Medium | DB writes are <1ms. Real bottleneck is cgroup/namespace setup. |
-| **crun fork/exec overhead** — ~15ms per operation | Low | Acceptable for target use case. In-process option (libcrun CGo) available for v2 if needed. |
+| Risk                                                                               | Impact | Mitigation                                                                                                                                                                              |
+| ---------------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Docker API fidelity** — undocumented CLI expectations beyond swagger spec        | High   | Custom route generator covers all 107 spec operations; moby types ensure response format matches Docker exactly; use socat traffic capture for undocumented behavior; golden-file tests |
+| **Streaming endpoints** — 4 protocols (logs, attach, pull progress, build session) | High   | Import moby's stdcopy. Implement in order of difficulty.                                                                                                                                |
+| **spec.go complexity** — Docker→OCI config translation is ~800 LOC of edge cases   | High   | Start minimal (hello-world), expand iteratively. Extensive unit tests.                                                                                                                  |
+| **containers/storage edge cases** — whiteouts, opaque dirs, metacopy               | Medium | Battle-tested library handles this. Trust it.                                                                                                                                           |
+| **bbolt single-writer** — concurrent container creates queue on DB writes          | Medium | DB writes are <1ms. Real bottleneck is cgroup/namespace setup.                                                                                                                          |
+| **crun fork/exec overhead** — ~15ms per operation                                  | Low    | Acceptable for target use case. In-process option (libcrun CGo) available for v2 if needed.                                                                                             |
