@@ -23,8 +23,9 @@ const (
 	// DriverBridge is the bridge network driver name.
 	DriverBridge = "bridge"
 
-	defaultSubnet  = "172.17.0.0/16"
-	defaultGateway = "172.17.0.1"
+	// Use 172.20.0.0/16 to avoid conflicts with Docker's default 172.17.0.0/16.
+	defaultSubnet  = "172.20.0.0/16"
+	defaultGateway = "172.20.0.1"
 )
 
 // ManagerStore is the persistence interface required by the network Manager.
@@ -729,7 +730,8 @@ func (m *Manager) autoAssignSubnet() (netip.Prefix, netip.Addr, error) {
 	}
 
 	// Try 172.18.0.0/16 through 172.31.0.0/16.
-	for second := 18; second <= 31; second++ {
+	// Start at 172.21 to avoid Docker's commonly used 172.17-19 range.
+	for second := 21; second <= 31; second++ {
 		subnet := netip.MustParsePrefix(fmt.Sprintf("172.%d.0.0/16", second))
 		if !usedSubnets[subnet.String()] {
 			gateway := netip.MustParseAddr(fmt.Sprintf("172.%d.0.1", second))
