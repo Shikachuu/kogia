@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -35,8 +36,8 @@ func TestWriteExecProcessSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), specData, 0o644); err != nil {
-		t.Fatal(err)
+	if writeErr := os.WriteFile(filepath.Join(dir, "config.json"), specData, 0o644); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 
 	m := &Manager{
@@ -60,8 +61,8 @@ func TestWriteExecProcessSpec(t *testing.T) {
 
 	processFile := filepath.Join(dir, "exec-test.json")
 
-	if err := m.writeExecProcessSpec(processFile, session, ac); err != nil {
-		t.Fatal(err)
+	if specErr := m.writeExecProcessSpec(processFile, session, ac); specErr != nil {
+		t.Fatal(specErr)
 	}
 
 	// Read and verify the process spec.
@@ -71,8 +72,8 @@ func TestWriteExecProcessSpec(t *testing.T) {
 	}
 
 	var proc ocispec.Process
-	if err := json.Unmarshal(data, &proc); err != nil {
-		t.Fatal(err)
+	if unmarshalErr := json.Unmarshal(data, &proc); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
 	}
 
 	if !proc.Terminal {
@@ -126,7 +127,7 @@ func TestExecInspect_NotFound(t *testing.T) {
 		execSessions: make(map[string]*ExecSession),
 	}
 
-	_, err := m.ExecInspect(nil, "nonexistent")
+	_, err := m.ExecInspect(context.Background(), "nonexistent")
 	if err == nil {
 		t.Error("expected error for nonexistent exec session")
 	}
@@ -159,7 +160,7 @@ func TestExecInspect_SessionState(t *testing.T) {
 	m.execSessions[session.ID] = session
 	m.execMu.Unlock()
 
-	resp, err := m.ExecInspect(nil, session.ID)
+	resp, err := m.ExecInspect(context.Background(), session.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

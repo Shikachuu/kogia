@@ -14,35 +14,30 @@ import (
 	clog "github.com/Shikachuu/kogia/internal/log"
 )
 
+// ErrStdinNotAvailable is returned when writing to stdin on a container that has no stdin pipe.
+var ErrStdinNotAvailable = errors.New("stdin not available")
+
 // containerIO manages stdio pipes/PTY and logging for a container.
 // It supports three modes:
 //   - Non-TTY without stdin: stdout/stderr pipes only (docker run -d)
 //   - Non-TTY with stdin: stdout/stderr + stdin pipes (docker run -i)
 //   - TTY: single PTY master fd for bidirectional I/O (docker run -it)
 type containerIO struct {
-	// Non-TTY pipe fields (nil when tty=true).
-	stdout     *os.File // write end — passed to crun as stdout
-	stderr     *os.File // write end — passed to crun as stderr
-	stdoutRead *os.File // read end — we read from this
-	stderrRead *os.File // read end — we read from this
-
-	// Stdin pipe (nil when stdin not requested).
-	stdin     *os.File // write end — attach client writes here
-	stdinRead *os.File // read end — passed to crun
-
-	// TTY fields (nil when tty=false).
-	ptyMaster *os.File // PTY master fd received via console-socket
-
-	driver        clog.Driver
-	wg            sync.WaitGroup
-	writersClosed bool // true if write-ends were closed by Start()
-	tty           bool
-
-	// Attach fan-out: registered writers receive container output.
-	mu              sync.Mutex
-	attachOut       []io.Writer
-	attachBuf       []byte // buffers early TTY output before first writer registers
-	attachBufFlushed bool  // true after first writer received the buffer
+	driver           clog.Driver
+	ptyMaster        *os.File
+	stderrRead       *os.File
+	stdin            *os.File
+	stdinRead        *os.File
+	stdout           *os.File
+	stderr           *os.File
+	stdoutRead       *os.File
+	attachOut        []io.Writer
+	attachBuf        []byte
+	wg               sync.WaitGroup
+	mu               sync.Mutex
+	tty              bool
+	writersClosed    bool
+	attachBufFlushed bool
 }
 
 // newContainerIO creates a containerIO in the appropriate mode.
@@ -80,6 +75,7 @@ func newContainerIO(driver clog.Driver, tty, openStdin bool) (*containerIO, erro
 	if err != nil {
 		_ = stdoutRead.Close()
 		_ = stdoutWrite.Close()
+
 		cio.closeStdinPipes()
 
 		return nil, fmt.Errorf("create stderr pipe: %w", err)
@@ -108,6 +104,7 @@ func (cio *containerIO) startCopyLoop() {
 	if cio.tty {
 		if cio.ptyMaster != nil {
 			cio.wg.Add(1)
+
 			go cio.copyStreamRaw(cio.ptyMaster, "stdout")
 		}
 
@@ -115,6 +112,7 @@ func (cio *containerIO) startCopyLoop() {
 	}
 
 	cio.wg.Add(2)
+
 	go cio.copyStream(cio.stdoutRead, "stdout")
 	go cio.copyStream(cio.stderrRead, "stderr")
 }
@@ -123,10 +121,13 @@ func (cio *containerIO) startCopyLoop() {
 // attach writers immediately (for interactive responsiveness), while also
 // accumulating lines for the log driver. This is used for TTY mode where
 // line-buffering would break interactive echo.
+//
+//nolint:gocognit // Raw stream copy handles multiple edge cases for TTY I/O.
 func (cio *containerIO) copyStreamRaw(r *os.File, stream string) {
 	defer cio.wg.Done()
 
 	buf := make([]byte, 32*1024)
+
 	var lineBuf []byte // accumulates partial lines for the log driver
 
 	for {
@@ -295,14 +296,24 @@ func (cio *containerIO) RemoveAttachWriter(w io.Writer) {
 // Returns an error if stdin is not available.
 func (cio *containerIO) WriteStdin(p []byte) (int, error) {
 	if cio.tty && cio.ptyMaster != nil {
-		return cio.ptyMaster.Write(p)
+		n, err := cio.ptyMaster.Write(p)
+		if err != nil {
+			return n, fmt.Errorf("write pty: %w", err)
+		}
+
+		return n, nil
 	}
 
 	if cio.stdin == nil {
-		return 0, fmt.Errorf("stdin not available")
+		return 0, ErrStdinNotAvailable
 	}
 
-	return cio.stdin.Write(p)
+	n, err := cio.stdin.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("write stdin: %w", err)
+	}
+
+	return n, nil
 }
 
 // CloseStdin closes the write end of the stdin pipe, delivering EOF to the

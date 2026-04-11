@@ -611,9 +611,9 @@ func (h *Handlers) ContainerAttach(w http.ResponseWriter, r *http.Request) {
 
 	isTTY := record.Config != nil && record.Config.Tty
 
-	// Use a detached context — r.Context() is cancelled after hijack since
+	// Use a detached context — r.Context() is canceled after hijack since
 	// Go's HTTP server considers the request done once the connection is taken.
-	_ = h.runtime.Attach(context.Background(), record.ID, &runtime.AttachOpts{
+	_ = h.runtime.Attach(context.Background(), record.ID, &runtime.AttachOpts{ //nolint:contextcheck // Detached context: r.Context() is canceled after hijack.
 		Conn:   conn,
 		Stdin:  wantStdin,
 		Stdout: wantStdout,
@@ -642,7 +642,7 @@ func (h *Handlers) ContainerResize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if resizeErr := h.runtime.Resize(r.Context(), id, uint16(height), uint16(width)); resizeErr != nil {
+	if resizeErr := h.runtime.Resize(r.Context(), id, uint16(height), uint16(width)); resizeErr != nil { //nolint:gosec // Height/width are validated terminal dimensions.
 		if isNotFound(resizeErr) {
 			respondError(w, errdefs.NotFound("no such container: "+id, resizeErr))
 

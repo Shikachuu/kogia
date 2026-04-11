@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -227,8 +228,8 @@ func TestNewContainerIO_NonTTY(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, false, false)
 
+	cio, err := newContainerIO(driver, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,8 +259,8 @@ func TestNewContainerIO_TTY(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, true, true)
 
+	cio, err := newContainerIO(driver, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,8 +290,8 @@ func TestNewContainerIO_WithStdin(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, false, true)
 
+	cio, err := newContainerIO(driver, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,8 +311,8 @@ func TestContainerIO_StdinPipe(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, false, true)
 
+	cio, err := newContainerIO(driver, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +339,7 @@ func TestContainerIO_StdinPipe(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if string(buf[:n]) != string(msg) {
+	if !bytes.Equal(buf[:n], msg) {
 		t.Errorf("stdin read: got %q, want %q", string(buf[:n]), string(msg))
 	}
 }
@@ -347,8 +348,8 @@ func TestContainerIO_CloseStdin(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, false, true)
 
+	cio, err := newContainerIO(driver, false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +364,7 @@ func TestContainerIO_CloseStdin(t *testing.T) {
 	buf := make([]byte, 1)
 
 	_, err = stdinR.Read(buf)
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("expected EOF after CloseStdin, got %v", err)
 	}
 }
@@ -372,8 +373,8 @@ func TestContainerIO_WriteStdin_NoStdin(t *testing.T) {
 	t.Parallel()
 
 	driver := &mockDriver{}
-	cio, err := newContainerIO(driver, false, false)
 
+	cio, err := newContainerIO(driver, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,6 +447,7 @@ func TestContainerIO_MultipleAttachWriters(t *testing.T) {
 	_ = w.Close()
 
 	cio.wg.Wait()
+
 	_ = r.Close()
 
 	if buf1.String() != "data\n" {
@@ -480,6 +482,7 @@ func TestContainerIO_RemoveAttachWriter(t *testing.T) {
 	_ = w.Close()
 
 	cio.wg.Wait()
+
 	_ = r.Close()
 
 	// Attach writer was removed, should have no data.

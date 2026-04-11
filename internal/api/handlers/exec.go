@@ -63,7 +63,7 @@ func (h *Handlers) ExecStart(w http.ResponseWriter, r *http.Request) {
 
 	if req.Detach {
 		// Detached exec: start in background, respond immediately.
-		go func() {
+		go func() { //nolint:contextcheck // Detached goroutine outlives the request.
 			_ = h.runtime.ExecStart(context.Background(), execID, &runtime.ExecStartOpts{
 				Detach: true,
 				TTY:    req.Tty,
@@ -97,8 +97,8 @@ func (h *Handlers) ExecStart(w http.ResponseWriter, r *http.Request) {
 	_, _ = buf.WriteString("\r\n")
 	_ = buf.Flush()
 
-	// Use detached context — r.Context() is cancelled after hijack.
-	_ = h.runtime.ExecStart(context.Background(), execID, &runtime.ExecStartOpts{
+	// Use detached context — r.Context() is canceled after hijack.
+	_ = h.runtime.ExecStart(context.Background(), execID, &runtime.ExecStartOpts{ //nolint:contextcheck // Detached context: r.Context() is canceled after hijack.
 		Conn: conn,
 		TTY:  req.Tty,
 	})
@@ -144,7 +144,7 @@ func (h *Handlers) ExecResize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if resizeErr := h.runtime.ExecResize(r.Context(), execID, uint16(height), uint16(width)); resizeErr != nil {
+	if resizeErr := h.runtime.ExecResize(r.Context(), execID, uint16(height), uint16(width)); resizeErr != nil { //nolint:gosec // Height/width are validated terminal dimensions.
 		if isExecNotFound(resizeErr) {
 			respondError(w, errdefs.NotFound("no such exec instance: "+execID, resizeErr))
 

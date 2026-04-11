@@ -57,7 +57,6 @@ func TestReceivePTYMaster(t *testing.T) {
 		rights := unix.UnixRights(int(ptyMaster.Fd()))
 		sendErr = unix.Sendmsg(int(fd), []byte{0}, rights, nil, 0)
 	})
-
 	if err != nil {
 		t.Fatalf("control: %v", err)
 	}
@@ -80,7 +79,7 @@ func TestReceivePTYMaster(t *testing.T) {
 	}
 
 	// Verify the socket file was cleaned up.
-	if _, err := os.Stat(sockPath); err == nil {
+	if _, statErr := os.Stat(sockPath); statErr == nil {
 		t.Error("socket file should have been cleaned up")
 	}
 }
@@ -98,7 +97,7 @@ func TestReceivePTYMaster_Timeout(t *testing.T) {
 	}
 
 	// Socket should be cleaned up.
-	if _, err := os.Stat(sockPath); err == nil {
+	if _, statErr := os.Stat(sockPath); statErr == nil {
 		t.Error("socket file should have been cleaned up after timeout")
 	}
 }
@@ -113,8 +112,8 @@ func TestResizePTY(t *testing.T) {
 	defer pty.Close()
 
 	// Resize to specific dimensions.
-	if err := resizePTY(pty, 40, 120); err != nil {
-		t.Fatalf("resizePTY: %v", err)
+	if resizeErr := resizePTY(pty, 40, 120); resizeErr != nil {
+		t.Fatalf("resizePTY: %v", resizeErr)
 	}
 
 	// Read back the window size.

@@ -9,6 +9,8 @@ import (
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 )
 
+const msgInternalServerError = "internal server error"
+
 // respondJSON encodes v as JSON and writes it to w with the given status code.
 func respondJSON[T any](w http.ResponseWriter, status int, v T) {
 	w.Header().Set("Content-Type", "application/json")
@@ -59,7 +61,7 @@ func respondError(w http.ResponseWriter, err error) {
 	if code == http.StatusInternalServerError {
 		slog.Error("request error", "status", code, "err", err.Error())
 
-		msg = "internal server error"
+		msg = msgInternalServerError
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -76,7 +78,7 @@ func respondError(w http.ResponseWriter, err error) {
 func errorJSON(w http.ResponseWriter, status int, err error) {
 	msg := errdefs.SafeMessage(err)
 	if status == http.StatusInternalServerError {
-		msg = "internal server error"
+		msg = msgInternalServerError
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -1,12 +1,19 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/moby/moby/api/types/container"
+)
+
+var (
+	// ErrInvalidStatFormat is returned when /proc/{pid}/stat cannot be parsed.
+	ErrInvalidStatFormat = errors.New("invalid stat format")
+	// ErrStatTooFewFields is returned when /proc/{pid}/stat has too few fields.
+	ErrStatTooFewFields = errors.New("stat has too few fields")
 )
 
 // defaultPSTitles are the column headers for container top output.
@@ -16,7 +23,7 @@ var defaultPSTitles = []string{"UID", "PID", "PPID", "C", "STIME", "TTY", "TIME"
 // container's cgroup.
 func readContainerProcesses(cgroupPath string) (*container.TopResponse, error) {
 	// Read all PIDs from the cgroup.
-	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
+	procsPath := cgroupPath + "/cgroup.procs"
 
 	data, err := os.ReadFile(procsPath) //nolint:gosec // Path constructed from resolved cgroup path.
 	if err != nil {
@@ -33,8 +40,8 @@ func readContainerProcesses(cgroupPath string) (*container.TopResponse, error) {
 			continue
 		}
 
-		proc, err := readProcInfo(pid)
-		if err != nil {
+		proc, procErr := readProcInfo(pid)
+		if procErr != nil {
 			continue // process may have exited
 		}
 
@@ -50,11 +57,11 @@ func readContainerProcesses(cgroupPath string) (*container.TopResponse, error) {
 // readProcInfo reads process info from /proc/{pid}/stat and /proc/{pid}/cmdline.
 // Returns fields matching defaultPSTitles: UID, PID, PPID, C, STIME, TTY, TIME, CMD.
 func readProcInfo(pid string) ([]string, error) {
-	statPath := filepath.Join("/proc", pid, "stat")
+	statPath := "/proc/" + pid + "/stat"
 
 	statData, err := os.ReadFile(statPath) //nolint:gosec // PID from cgroup.procs.
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read proc stat: %w", err)
 	}
 
 	// Parse /proc/{pid}/stat. The format is:
@@ -64,13 +71,13 @@ func readProcInfo(pid string) ([]string, error) {
 	lastParen := strings.LastIndex(statStr, ")")
 
 	if lastParen < 0 {
-		return nil, fmt.Errorf("invalid stat format")
+		return nil, ErrInvalidStatFormat
 	}
 
 	// Fields after the closing paren.
 	afterComm := strings.Fields(statStr[lastParen+2:])
 	if len(afterComm) < 20 {
-		return nil, fmt.Errorf("stat has too few fields")
+		return nil, ErrStatTooFewFields
 	}
 
 	ppid := afterComm[1]  // field 4 (0-indexed: state=0, ppid=1)
@@ -102,7 +109,7 @@ func readProcInfo(pid string) ([]string, error) {
 
 // readProcUID reads the UID from /proc/{pid}/status.
 func readProcUID(pid string) string {
-	data, err := os.ReadFile(filepath.Join("/proc", pid, "status")) //nolint:gosec // PID from cgroup.procs.
+	data, err := os.ReadFile("/proc/" + pid + "/status") //nolint:gosec // PID from cgroup.procs.
 	if err != nil {
 		return "?"
 	}
@@ -122,7 +129,7 @@ func readProcUID(pid string) string {
 
 // readProcCmdline reads /proc/{pid}/cmdline and returns it as a single string.
 func readProcCmdline(pid string) string {
-	data, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline")) //nolint:gosec // PID from cgroup.procs.
+	data, err := os.ReadFile("/proc/" + pid + "/cmdline") //nolint:gosec // PID from cgroup.procs.
 	if err != nil || len(data) == 0 {
 		return "[" + readProcComm(pid) + "]"
 	}
@@ -135,11 +142,10 @@ func readProcCmdline(pid string) string {
 
 // readProcComm reads /proc/{pid}/comm as a fallback when cmdline is empty.
 func readProcComm(pid string) string {
-	data, err := os.ReadFile(filepath.Join("/proc", pid, "comm")) //nolint:gosec // PID from cgroup.procs.
+	data, err := os.ReadFile("/proc/" + pid + "/comm") //nolint:gosec // PID from cgroup.procs.
 	if err != nil {
 		return pid
 	}
 
 	return strings.TrimSpace(string(data))
 }
-

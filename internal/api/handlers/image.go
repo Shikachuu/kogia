@@ -199,7 +199,7 @@ func (h *Handlers) ImageGet(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-tar")
 
-	if err := h.images.Export([]string{name}, w); err != nil {
+	if err := h.images.Export([]string{name}, w); err != nil { //nolint:contextcheck // Export does not accept context yet.
 		if errors.Is(err, image.ErrNotFound) {
 			respondError(w, errdefs.NotFound("no such image: "+name, err))
 
@@ -221,7 +221,7 @@ func (h *Handlers) ImageGetAll(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/x-tar")
 
-	if err := h.images.Export(names, w); err != nil {
+	if err := h.images.Export(names, w); err != nil { //nolint:contextcheck // Export does not accept context yet.
 		slog.Error("image export failed", "images", names, "err", err)
 	}
 }

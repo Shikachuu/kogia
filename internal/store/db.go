@@ -29,7 +29,11 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
 	}
 
-	buckets := []string{bucketMeta, bucketContainers, bucketContNames, bucketContBundles}
+	buckets := []string{
+		bucketMeta,
+		bucketContainers, bucketContNames, bucketContBundles,
+		bucketNetworks, bucketNetworkNames, bucketEndpoints, bucketIPAM,
+	}
 
 	if err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range buckets {

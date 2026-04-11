@@ -1299,7 +1299,6 @@ func TestGenerateSpec_TTY(t *testing.T) {
 		RootPath:   rootfs,
 		Hostname:   "test12345678",
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1324,7 +1323,6 @@ func TestGenerateSpec_NoTTY_Explicit(t *testing.T) {
 		RootPath:   rootfs,
 		Hostname:   "test12345678",
 	})
-
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,8 +18,10 @@ import (
 
 	"github.com/Shikachuu/kogia/internal/image"
 	"github.com/Shikachuu/kogia/internal/log/jsonfile"
+	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/store"
 	"github.com/moby/moby/api/types/container"
+	ocispec "github.com/opencontainers/runtime-spec/specs-go"
 )
 
 var (
@@ -33,13 +35,22 @@ var (
 	ErrNoSpecRoot = errors.New("spec has no root field")
 	// ErrConfigRequired is returned when container config is nil.
 	ErrConfigRequired = errors.New("config is required")
+	// ErrAlreadyPaused is returned when trying to pause an already paused container.
+	ErrAlreadyPaused = errors.New("container is already paused")
+	// ErrNotPaused is returned when trying to unpause a container that is not paused.
+	ErrNotPaused = errors.New("container is not paused")
+	// ErrTargetNotRunning is returned when a container:<id> network target is not running.
+	ErrTargetNotRunning = errors.New("target container is not running")
 )
+
+const defaultNetworkMode = "bridge"
 
 // Manager manages container lifecycle via crun.
 type Manager struct {
 	crun         *CrunConfig
 	store        *store.Store
 	images       *image.Store
+	netManager   *network.Manager
 	active       map[string]*activeContainer
 	pidMap       map[int]string
 	execSessions map[string]*ExecSession
@@ -62,11 +73,12 @@ type activeContainer struct {
 
 // ManagerConfig holds configuration for the runtime Manager.
 type ManagerConfig struct {
-	Store      *store.Store
-	Images     *image.Store
-	CrunBinary string
-	CrunRoot   string
-	BundleRoot string
+	Store          *store.Store
+	Images         *image.Store
+	NetworkManager *network.Manager
+	CrunBinary     string
+	CrunRoot       string
+	BundleRoot     string
 }
 
 // NewManager creates a new container runtime manager.
@@ -78,6 +90,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		},
 		store:        cfg.Store,
 		images:       cfg.Images,
+		netManager:   cfg.NetworkManager,
 		bundleRoot:   cfg.BundleRoot,
 		active:       make(map[string]*activeContainer),
 		pidMap:       make(map[int]string),
@@ -254,6 +267,52 @@ func (m *Manager) buildContainerRecord(
 ) (*container.InspectResponse, error) {
 	hostname := id[:12]
 
+	// Resolve network mode.
+	networkMode := defaultNetworkMode
+	if hostCfg != nil && string(hostCfg.NetworkMode) != "" && string(hostCfg.NetworkMode) != "default" {
+		networkMode = string(hostCfg.NetworkMode)
+	}
+
+	// Build bind mounts for /etc network files.
+	etcBindMounts := []ocispec.Mount{
+		{
+			Destination: "/etc/hostname",
+			Type:        "bind",
+			Source:      filepath.Join(bundleDir, "hostname"),
+			Options:     []string{"rbind", "rprivate", "rw"},
+		},
+		{
+			Destination: "/etc/hosts",
+			Type:        "bind",
+			Source:      filepath.Join(bundleDir, "hosts"),
+			Options:     []string{"rbind", "rprivate", "rw"},
+		},
+		{
+			Destination: "/etc/resolv.conf",
+			Type:        "bind",
+			Source:      filepath.Join(bundleDir, "resolv.conf"),
+			Options:     []string{"rbind", "rprivate", "rw"},
+		},
+	}
+
+	// Resolve network namespace path for container:<id> mode.
+	var networkNSPath string
+
+	if strings.HasPrefix(networkMode, "container:") {
+		targetID := strings.TrimPrefix(networkMode, "container:")
+
+		targetRecord, targetErr := m.store.GetContainer(targetID)
+		if targetErr != nil {
+			return nil, fmt.Errorf("runtime: resolve container network target %q: %w", targetID, targetErr)
+		}
+
+		if targetRecord.State == nil || !targetRecord.State.Running {
+			return nil, fmt.Errorf("runtime: %w: %s", ErrTargetNotRunning, targetID)
+		}
+
+		networkNSPath = fmt.Sprintf("/proc/%d/ns/net", targetRecord.State.Pid)
+	}
+
 	// Generate OCI spec.
 	spec, err := GenerateSpec(&SpecOpts{
 		Config:          cfg,
@@ -265,6 +324,9 @@ func (m *Manager) buildContainerRecord(
 		ImageUser:       imgCfg.User,
 		RootPath:        rootPath,
 		Hostname:        hostname,
+		NetworkMode:     networkMode,
+		NetworkNSPath:   networkNSPath,
+		ExtraBindMounts: etcBindMounts,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("runtime: generate spec: %w", err)
@@ -327,6 +389,8 @@ func (m *Manager) buildContainerRecord(
 }
 
 // Start starts a created or stopped container.
+//
+//nolint:gocyclo,gocognit // Start orchestrates the full container startup sequence.
 func (m *Manager) Start(ctx context.Context, id string) error {
 	record, err := m.store.GetContainer(id)
 	if err != nil {
@@ -471,6 +535,17 @@ func (m *Manager) Start(ctx context.Context, id string) error {
 		cio.Close()
 
 		return fmt.Errorf("runtime: read pid: %w", err)
+	}
+
+	// Configure container networking (after crun create, before crun start).
+	if m.netManager != nil {
+		if netErr := m.setupContainerNetworking(record, bundleDir, pid); netErr != nil {
+			_ = m.crun.deleteContainer(ctx, record.ID)
+
+			cio.Close()
+
+			return fmt.Errorf("runtime: setup networking: %w", netErr)
+		}
 	}
 
 	// Register in active map + pidMap BEFORE crun start. This prevents a
@@ -653,6 +728,13 @@ func (m *Manager) Remove(ctx context.Context, id string, force bool) error {
 		}
 	}
 
+	// Disconnect from all networks (idempotent if already disconnected on exit).
+	if m.netManager != nil {
+		if disconnErr := m.netManager.DisconnectAll(record.ID); disconnErr != nil {
+			slog.Warn("failed to disconnect container from networks during remove", "id", record.ID[:12], "err", disconnErr)
+		}
+	}
+
 	// Clean up crun state.
 	delCtx, delCancel := context.WithTimeout(ctx, CrunOperationTimeout)
 	defer delCancel()
@@ -778,14 +860,14 @@ func (m *Manager) Pause(ctx context.Context, id string) error {
 	}
 
 	if record.State.Paused {
-		return fmt.Errorf("runtime: container is already paused: %s", record.ID[:12])
+		return fmt.Errorf("runtime: %w: %s", ErrAlreadyPaused, record.ID[:12])
 	}
 
 	pauseCtx, cancel := context.WithTimeout(ctx, CrunOperationTimeout)
 	defer cancel()
 
-	if err := m.crun.pause(pauseCtx, record.ID); err != nil {
-		return fmt.Errorf("runtime: pause: %w", err)
+	if pauseErr := m.crun.pause(pauseCtx, record.ID); pauseErr != nil {
+		return fmt.Errorf("runtime: pause: %w", pauseErr)
 	}
 
 	record.State.Status = container.StatePaused
@@ -806,14 +888,14 @@ func (m *Manager) Unpause(ctx context.Context, id string) error {
 	}
 
 	if !record.State.Paused {
-		return fmt.Errorf("runtime: container is not paused: %s", record.ID[:12])
+		return fmt.Errorf("runtime: %w: %s", ErrNotPaused, record.ID[:12])
 	}
 
 	resumeCtx, cancel := context.WithTimeout(ctx, CrunOperationTimeout)
 	defer cancel()
 
-	if err := m.crun.resume(resumeCtx, record.ID); err != nil {
-		return fmt.Errorf("runtime: unpause: %w", err)
+	if resumeErr := m.crun.resume(resumeCtx, record.ID); resumeErr != nil {
+		return fmt.Errorf("runtime: unpause: %w", resumeErr)
 	}
 
 	record.State.Status = container.StateRunning
@@ -827,7 +909,7 @@ func (m *Manager) Unpause(ctx context.Context, id string) error {
 }
 
 // Top lists processes running in the container.
-func (m *Manager) Top(ctx context.Context, id, psArgs string) (*container.TopResponse, error) {
+func (m *Manager) Top(_ context.Context, id, _ string) (*container.TopResponse, error) {
 	record, err := m.store.GetContainer(id)
 	if err != nil {
 		return nil, fmt.Errorf("runtime: %w", err)
@@ -849,6 +931,8 @@ func (m *Manager) Top(ctx context.Context, id, psArgs string) (*container.TopRes
 }
 
 // HandleExit is called by the reaper when a child process exits.
+//
+//nolint:gocyclo // HandleExit manages cleanup, state update, network disconnect, auto-remove, and restart.
 func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 	m.mu.Lock()
 
@@ -901,6 +985,13 @@ func (m *Manager) HandleExit(pid, exitCode int, oomKilled bool) {
 
 	if updateErr := m.store.UpdateContainer(record); updateErr != nil {
 		slog.Error("failed to update container exit state", "id", containerID[:12], "err", updateErr)
+	}
+
+	// Disconnect from all networks.
+	if m.netManager != nil {
+		if disconnErr := m.netManager.DisconnectAll(containerID); disconnErr != nil {
+			slog.Warn("failed to disconnect container from networks", "id", containerID[:12], "err", disconnErr)
+		}
 	}
 
 	// Signal waiters.
@@ -1099,6 +1190,8 @@ type AttachOpts struct {
 
 // Attach connects a client to a running container's stdio.
 // It blocks until the container exits or the client disconnects.
+//
+//nolint:gocognit,gocyclo // Attach manages complex bidirectional streaming with polling.
 func (m *Manager) Attach(ctx context.Context, id string, opts *AttachOpts) error {
 	// Wait for the container to appear in the active map (Docker CLI sends
 	// attach before start for `docker run`).
@@ -1201,4 +1294,97 @@ func readPIDFile(path string) (int, error) {
 	}
 
 	return pid, nil
+}
+
+// setupContainerNetworking connects the container to its network(s) and generates
+// /etc/hostname, /etc/hosts, /etc/resolv.conf files.
+//nolint:gocognit,gocyclo // Orchestrates network setup with port mapping resolution.
+func (m *Manager) setupContainerNetworking(record *container.InspectResponse, bundleDir string, pid int) error {
+	networkMode := defaultNetworkMode
+	if record.HostConfig != nil && string(record.HostConfig.NetworkMode) != "" && string(record.HostConfig.NetworkMode) != "default" {
+		networkMode = string(record.HostConfig.NetworkMode)
+	}
+
+	// Host and none modes don't need network connect.
+	if networkMode == "host" || networkMode == "none" || strings.HasPrefix(networkMode, "container:") {
+		// Still generate /etc files.
+		if genErr := m.netManager.GenerateNetworkFiles(bundleDir, record.ID, record.ID[:12], nil); genErr != nil {
+			return fmt.Errorf("generate network files: %w", genErr)
+		}
+
+		return nil
+	}
+
+	// Resolve the network name to an ID.
+	networkName := networkMode
+	if networkName == defaultNetworkMode {
+		networkName = network.DefaultNetworkName
+	}
+
+	netRec, netErr := m.netManager.GetNetwork(networkName)
+	if netErr != nil {
+		return fmt.Errorf("resolve network %q: %w", networkName, netErr)
+	}
+
+	// Resolve port mappings from HostConfig.PortBindings.
+	// PortBindings is map[network.Port][]network.PortBinding from moby types.
+	var portMappings []network.PortMapping
+
+	if record.HostConfig != nil && record.HostConfig.PortBindings != nil {
+		for port, dockerBindings := range record.HostConfig.PortBindings {
+			containerPort := port.Num()
+			proto := string(port.Proto())
+
+			for _, db := range dockerBindings {
+				var hostPort uint16
+
+				if db.HostPort != "" {
+					parsed, parseErr := strconv.ParseUint(db.HostPort, 10, 16)
+					if parseErr != nil {
+						return fmt.Errorf("invalid host port %q: %w", db.HostPort, parseErr)
+					}
+
+					hostPort = uint16(parsed)
+				}
+
+				// Ephemeral port: resolve now.
+				if hostPort == 0 {
+					resolved, resolveErr := network.FindAvailablePort(proto)
+					if resolveErr != nil {
+						return fmt.Errorf("find available port: %w", resolveErr)
+					}
+
+					hostPort = resolved
+				}
+
+				portMappings = append(portMappings, network.PortMapping{
+					HostIP:        db.HostIP,
+					HostPort:      hostPort,
+					ContainerPort: containerPort,
+					Protocol:      proto,
+				})
+			}
+		}
+	}
+
+	// Connect container to network.
+	ep, connectErr := m.netManager.Connect(netRec.ID, record.ID, record.Name, pid, portMappings)
+	if connectErr != nil {
+		return fmt.Errorf("connect to network %q: %w", networkName, connectErr)
+	}
+
+	// Generate /etc files.
+	var endpoints []*network.EndpointRecord
+	if ep != nil {
+		endpoints = []*network.EndpointRecord{ep}
+	}
+
+	if genErr := m.netManager.GenerateNetworkFiles(bundleDir, record.ID, record.ID[:12], endpoints); genErr != nil {
+		return fmt.Errorf("generate network files: %w", genErr)
+	}
+
+	// Update hosts files for other containers on this network.
+	m.netManager.UpdateHostsFile(netRec.ID)
+
+	return nil
 }

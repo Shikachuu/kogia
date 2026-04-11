@@ -40,6 +40,12 @@ type SpecOpts struct {
 	ImageEnv        []string
 	ImageEntrypoint []string
 	ImageCmd        []string
+	// NetworkMode is the container's network mode: "bridge", "host", "none", or "container:<id>".
+	NetworkMode string
+	// NetworkNSPath is the path to an existing network namespace (for "container:<id>" mode).
+	NetworkNSPath string
+	// ExtraBindMounts are additional bind mounts (e.g. /etc/hosts, /etc/resolv.conf, /etc/hostname).
+	ExtraBindMounts []ocispec.Mount
 }
 
 // defaultCaps are the Docker default Linux capabilities.
@@ -119,9 +125,9 @@ func GenerateSpec(opts *SpecOpts) (*ocispec.Spec, error) {
 			Path:     opts.RootPath,
 			Readonly: opts.HostConfig != nil && opts.HostConfig.ReadonlyRootfs,
 		},
-		Mounts: defaultMounts(),
+		Mounts: appendMounts(defaultMounts(), opts.ExtraBindMounts),
 		Linux: &ocispec.Linux{
-			Namespaces:    defaultNamespaces(),
+			Namespaces:    buildNamespaces(opts.NetworkMode, opts.NetworkNSPath),
 			MaskedPaths:   defaultMaskedPaths,
 			ReadonlyPaths: defaultReadonlyPaths,
 			Resources:     buildResources(opts),
@@ -603,15 +609,42 @@ func defaultMounts() []ocispec.Mount {
 	}
 }
 
-func defaultNamespaces() []ocispec.LinuxNamespace {
-	return []ocispec.LinuxNamespace{
+// buildNamespaces returns the OCI namespace list based on network mode.
+func buildNamespaces(networkMode, nsPath string) []ocispec.LinuxNamespace {
+	ns := []ocispec.LinuxNamespace{
 		{Type: ocispec.PIDNamespace},
 		{Type: ocispec.MountNamespace},
 		{Type: ocispec.IPCNamespace},
 		{Type: ocispec.UTSNamespace},
-		// Network namespace is added in Phase 4.
 		// User namespace is not used by default (matches Docker behavior).
 	}
+
+	switch {
+	case networkMode == "host":
+		// Share host network namespace — do not add a network namespace.
+	case nsPath != "":
+		// Share another container's netns (container:<id> mode).
+		ns = append(ns, ocispec.LinuxNamespace{
+			Type: ocispec.NetworkNamespace,
+			Path: nsPath,
+		})
+	default:
+		// "bridge", "none", or default — crun creates a new netns.
+		ns = append(ns, ocispec.LinuxNamespace{
+			Type: ocispec.NetworkNamespace,
+		})
+	}
+
+	return ns
+}
+
+// appendMounts appends extra mounts to the base set.
+func appendMounts(base, extra []ocispec.Mount) []ocispec.Mount {
+	if len(extra) == 0 {
+		return base
+	}
+
+	return append(base, extra...)
 }
 
 func isPrivileged(opts *SpecOpts) bool {

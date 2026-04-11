@@ -105,6 +105,7 @@ func (c *CrunConfig) createWithConsole(ctx context.Context, id, bundleDir, pidFi
 	cmd := exec.CommandContext(ctx, c.BinaryPath, fullArgs...) //nolint:gosec // BinaryPath is the embedded crun binary, not user input.
 
 	var stderr bytes.Buffer
+
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {

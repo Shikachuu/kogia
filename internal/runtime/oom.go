@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +19,8 @@ import (
 // The watcher runs in a goroutine and stops when cancel is called or
 // the inotify fd is closed. The existing post-mortem check in reapChildren
 // is kept as a fallback.
+//
+//nolint:gocognit // OOM watch manages inotify lifecycle with event parsing.
 func (m *Manager) startOOMWatch(containerID, cgroupPath string) func() {
 	eventsPath := filepath.Join(cgroupPath, "memory.events")
 
@@ -37,7 +40,8 @@ func (m *Manager) startOOMWatch(containerID, cgroupPath string) func() {
 
 	wd, err := unix.InotifyAddWatch(fd, eventsPath, unix.IN_MODIFY)
 	if err != nil {
-		unix.Close(fd)
+		_ = unix.Close(fd)
+
 		slog.Debug("inotify add watch failed", "path", eventsPath, "err", err)
 
 		return func() {}
@@ -50,12 +54,12 @@ func (m *Manager) startOOMWatch(containerID, cgroupPath string) func() {
 		oomDetected := false
 
 		for {
-			n, err := unix.Read(fd, buf)
-			if err != nil {
+			n, readErr := unix.Read(fd, buf)
+			if readErr != nil {
 				// fd was closed by cancel or EAGAIN (no data available with non-blocking).
-				if err == unix.EAGAIN {
+				if errors.Is(readErr, unix.EAGAIN) {
 					// Use epoll to wait for events without busy-spinning.
-					pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+					pollFds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}} //nolint:gosec // File descriptor fits in int32.
 
 					_, pollErr := unix.Poll(pollFds, -1) // -1 = block indefinitely
 					if pollErr != nil {
@@ -88,11 +92,12 @@ func (m *Manager) startOOMWatch(containerID, cgroupPath string) func() {
 
 				if checkOOMKill(eventsPath) {
 					oomDetected = true
+
 					slog.Info("OOM kill detected", "container", containerID[:12])
 
 					// Update container state in bbolt.
-					record, err := m.store.GetContainer(containerID)
-					if err == nil {
+					record, getErr := m.store.GetContainer(containerID)
+					if getErr == nil {
 						record.State.OOMKilled = true
 
 						if updateErr := m.store.UpdateContainer(record); updateErr != nil {
@@ -104,12 +109,12 @@ func (m *Manager) startOOMWatch(containerID, cgroupPath string) func() {
 		}
 
 		// Clean up watch descriptor (may fail if fd already closed, that's fine).
-		unix.InotifyRmWatch(fd, uint32(wd))
+		_, _ = unix.InotifyRmWatch(fd, uint32(wd)) //nolint:gosec // Watch descriptor fits in uint32.
 	}()
 
 	return func() {
 		// Close the fd, which causes the goroutine's Read() to return an error.
-		unix.Close(fd)
+		_ = unix.Close(fd)
 	}
 }
 

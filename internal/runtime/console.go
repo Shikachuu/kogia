@@ -1,12 +1,20 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
+)
+
+var (
+	// ErrNoControlMessages is returned when no SCM control messages are received.
+	ErrNoControlMessages = errors.New("no control messages received")
+	// ErrNoFileDescriptors is returned when no file descriptors are received via SCM_RIGHTS.
+	ErrNoFileDescriptors = errors.New("no file descriptors received")
 )
 
 // ReceivePTYMaster listens on a Unix socket and receives a PTY master file
@@ -19,27 +27,29 @@ func ReceivePTYMaster(socketPath string, timeout time.Duration) (*os.File, error
 	if err != nil {
 		return nil, fmt.Errorf("console socket listen: %w", err)
 	}
+
 	defer func() {
 		_ = ln.Close()
 		_ = os.Remove(socketPath)
 	}()
 
-	if err := ln.SetDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, fmt.Errorf("console socket deadline: %w", err)
+	if deadlineErr := ln.SetDeadline(time.Now().Add(timeout)); deadlineErr != nil {
+		return nil, fmt.Errorf("console socket deadline: %w", deadlineErr)
 	}
 
 	conn, err := ln.AcceptUnix()
 	if err != nil {
 		return nil, fmt.Errorf("console socket accept: %w", err)
 	}
-	defer conn.Close()
+
+	defer func() { _ = conn.Close() }()
 
 	// Use Go's ReadMsgUnix which properly handles the non-blocking fd
 	// through the runtime poller, avoiding EAGAIN errors.
 	buf := make([]byte, 1)
 	oob := make([]byte, unix.CmsgLen(4)) // space for one fd
 
-	_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob)
+	_, oobn, _, _, err := conn.ReadMsgUnix(buf, oob) //nolint:dogsled // ReadMsgUnix returns 5 values; only oobn and err are needed.
 	if err != nil {
 		return nil, fmt.Errorf("console socket recvmsg: %w", err)
 	}
@@ -50,7 +60,7 @@ func ReceivePTYMaster(socketPath string, timeout time.Duration) (*os.File, error
 	}
 
 	if len(msgs) == 0 {
-		return nil, fmt.Errorf("no control messages received")
+		return nil, ErrNoControlMessages
 	}
 
 	fds, err := unix.ParseUnixRights(&msgs[0])
@@ -59,15 +69,15 @@ func ReceivePTYMaster(socketPath string, timeout time.Duration) (*os.File, error
 	}
 
 	if len(fds) == 0 {
-		return nil, fmt.Errorf("no file descriptors received")
+		return nil, ErrNoFileDescriptors
 	}
 
 	// Close any extra fds we received.
 	for _, extra := range fds[1:] {
-		unix.Close(extra)
+		_ = unix.Close(extra)
 	}
 
-	return os.NewFile(uintptr(fds[0]), "pty-master"), nil
+	return os.NewFile(uintptr(fds[0]), "pty-master"), nil //nolint:gosec // File descriptor from SCM_RIGHTS fits in uintptr.
 }
 
 // resizePTY sets the terminal window size on a PTY master fd.
@@ -77,5 +87,9 @@ func resizePTY(ptyMaster *os.File, height, width uint16) error {
 		Col: width,
 	}
 
-	return unix.IoctlSetWinsize(int(ptyMaster.Fd()), unix.TIOCSWINSZ, ws)
+	if err := unix.IoctlSetWinsize(int(ptyMaster.Fd()), unix.TIOCSWINSZ, ws); err != nil { //nolint:gosec // File descriptor fits in int.
+		return fmt.Errorf("set winsize: %w", err)
+	}
+
+	return nil
 }

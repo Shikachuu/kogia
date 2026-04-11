@@ -26,15 +26,15 @@ var (
 
 // ExecSession tracks state for a single exec instance.
 type ExecSession struct {
-	mu          sync.Mutex
+	ExitCode    *int
+	ptyMaster   *os.File
 	ID          string
 	ContainerID string
 	Config      container.ExecCreateRequest
-	Running     bool
-	ExitCode    *int
 	Pid         int
-	ptyMaster   *os.File // for resize, nil if non-TTY
-	started     bool     // true after ExecStart called
+	mu          sync.Mutex
+	Running     bool
+	started     bool
 }
 
 // ExecStartOpts configures an exec start session.
@@ -45,7 +45,7 @@ type ExecStartOpts struct {
 }
 
 // ExecCreate creates a new exec instance for the given container.
-func (m *Manager) ExecCreate(ctx context.Context, containerID string, req container.ExecCreateRequest) (string, error) {
+func (m *Manager) ExecCreate(_ context.Context, containerID string, req container.ExecCreateRequest) (string, error) { //nolint:gocritic // hugeParam: keeping value receiver to match Docker API handler call site.
 	record, err := m.store.GetContainer(containerID)
 	if err != nil {
 		return "", fmt.Errorf("runtime: exec create: %w", err)
@@ -111,7 +111,7 @@ func (m *Manager) ExecStart(ctx context.Context, execID string, opts *ExecStartO
 		return fmt.Errorf("runtime: exec start: %w", err)
 	}
 
-	defer os.Remove(processFile)
+	defer func() { _ = os.Remove(processFile) }()
 
 	if session.Config.Tty {
 		return m.execWithTTY(ctx, session, ac, processFile, opts)
@@ -139,6 +139,7 @@ func (m *Manager) execWithTTY(ctx context.Context, session *ExecSession, ac *act
 	cmd := m.crun.execWithConsole(ctx, session.ContainerID, processFile, consoleSock)
 
 	var stderr bytes.Buffer
+
 	cmd.Stderr = &stderr
 
 	if err := cmd.Start(); err != nil {
@@ -155,7 +156,8 @@ func (m *Manager) execWithTTY(ctx context.Context, session *ExecSession, ac *act
 	}
 
 	pty := result.file
-	defer pty.Close()
+
+	defer func() { _ = pty.Close() }()
 
 	session.mu.Lock()
 	session.Running = true
@@ -169,11 +171,13 @@ func (m *Manager) execWithTTY(ctx context.Context, session *ExecSession, ac *act
 
 		go func() {
 			_, _ = io.Copy(opts.Conn, pty)
+
 			done <- struct{}{}
 		}()
 
 		go func() {
 			_, _ = io.Copy(pty, opts.Conn)
+
 			done <- struct{}{}
 		}()
 
@@ -192,7 +196,7 @@ func (m *Manager) execWithTTY(ctx context.Context, session *ExecSession, ac *act
 }
 
 // execWithPipes runs an exec session with stdin/stdout/stderr pipes.
-func (m *Manager) execWithPipes(ctx context.Context, session *ExecSession, ac *activeContainer, processFile string, opts *ExecStartOpts) error {
+func (m *Manager) execWithPipes(ctx context.Context, session *ExecSession, _ *activeContainer, processFile string, opts *ExecStartOpts) error {
 	cmd := m.crun.execCmd(ctx, session.ContainerID, processFile)
 
 	var stderr bytes.Buffer
@@ -225,6 +229,7 @@ func (m *Manager) execWithPipes(ctx context.Context, session *ExecSession, ac *a
 // finishExec records the exit code and marks the session as not running.
 func (m *Manager) finishExec(session *ExecSession, waitErr error) error {
 	exitCode := 0
+
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
@@ -259,6 +264,7 @@ func (m *Manager) ExecInspect(_ context.Context, execID string) (*container.Exec
 	defer session.mu.Unlock()
 
 	entrypoint := ""
+
 	var args []string
 
 	if len(session.Config.Cmd) > 0 {
@@ -335,8 +341,8 @@ func (m *Manager) writeExecProcessSpec(path string, session *ExecSession, ac *ac
 	}
 
 	var spec ocispec.Spec
-	if err := json.Unmarshal(specData, &spec); err != nil {
-		return fmt.Errorf("parse container spec: %w", err)
+	if unmarshalErr := json.Unmarshal(specData, &spec); unmarshalErr != nil {
+		return fmt.Errorf("parse container spec: %w", unmarshalErr)
 	}
 
 	// Build exec process from container defaults + exec config.
@@ -371,8 +377,8 @@ func (m *Manager) writeExecProcessSpec(path string, session *ExecSession, ac *ac
 		return fmt.Errorf("marshal exec process: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("write exec process: %w", err)
+	if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
+		return fmt.Errorf("write exec process: %w", writeErr)
 	}
 
 	return nil
