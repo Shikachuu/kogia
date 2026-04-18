@@ -18,6 +18,7 @@ import (
 	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
 )
 
 // isNotFound returns true if the error chain contains store.ErrNotFound.
@@ -77,6 +78,11 @@ func (h *Handlers) ContainerCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.ContainerEventType, events.ActionCreate, id, map[string]string{
+		"name":  name,
+		"image": req.Image,
+	})
+
 	respondJSON(w, http.StatusCreated, container.CreateResponse{
 		ID:       id,
 		Warnings: []string{},
@@ -106,6 +112,8 @@ func (h *Handlers) ContainerStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.ContainerEventType, events.ActionStart, id, nil)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -131,6 +139,9 @@ func (h *Handlers) ContainerStop(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.ContainerEventType, events.ActionStop, id, nil)
+	h.publishEvent(events.ContainerEventType, events.ActionDie, id, nil)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -168,6 +179,9 @@ func (h *Handlers) ContainerKill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.ContainerEventType, events.ActionKill, id, map[string]string{"signal": signal})
+	h.publishEvent(events.ContainerEventType, events.ActionDie, id, nil)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -193,6 +207,8 @@ func (h *Handlers) ContainerRestart(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.ContainerEventType, events.ActionRestart, id, nil)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -270,6 +286,8 @@ func (h *Handlers) ContainerDelete(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.ContainerEventType, events.ActionDestroy, id, nil)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -669,6 +687,8 @@ func (h *Handlers) ContainerPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.ContainerEventType, events.ActionPause, id, nil)
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -687,6 +707,8 @@ func (h *Handlers) ContainerUnpause(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.ContainerEventType, events.ActionUnPause, id, nil)
 
 	w.WriteHeader(http.StatusNoContent)
 }

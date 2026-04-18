@@ -10,6 +10,7 @@ import (
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/store"
+	"github.com/moby/moby/api/types/events"
 	mobynetwork "github.com/moby/moby/api/types/network"
 )
 
@@ -52,6 +53,8 @@ func (h *Handlers) NetworkCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.NetworkEventType, events.ActionCreate, id, map[string]string{"name": req.Name})
+
 	respondJSON(w, http.StatusCreated, mobynetwork.CreateResponse{
 		ID:      id,
 		Warning: "",
@@ -76,6 +79,8 @@ func (h *Handlers) NetworkDelete(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.NetworkEventType, events.ActionDestroy, idOrName, nil)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -163,6 +168,10 @@ func (h *Handlers) NetworkConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.NetworkEventType, events.ActionConnect, netRec.ID, map[string]string{
+		"container": record.ID,
+	})
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -197,6 +206,10 @@ func (h *Handlers) NetworkDisconnect(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	h.publishEvent(events.NetworkEventType, events.ActionDisconnect, netRec.ID, map[string]string{
+		"container": req.Container,
+	})
 
 	w.WriteHeader(http.StatusOK)
 }

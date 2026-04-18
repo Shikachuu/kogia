@@ -53,6 +53,7 @@ type Manager struct {
 	store        *store.Store
 	images       *image.Store
 	netManager   *network.Manager
+	volResolver  VolumeResolver
 	active       map[string]*activeContainer
 	pidMap       map[int]string
 	execSessions map[string]*ExecSession
@@ -80,13 +81,14 @@ type ManagerConfig struct {
 	Store          *store.Store
 	Images         *image.Store
 	NetworkManager *network.Manager
+	VolumeResolver VolumeResolver
 	CrunBinary     string
 	CrunRoot       string
 	BundleRoot     string
 }
 
 // NewManager creates a new container runtime manager.
-func NewManager(cfg ManagerConfig) *Manager {
+func NewManager(cfg ManagerConfig) *Manager { //nolint:gocritic // Config struct passed by value at init time.
 	return &Manager{
 		crun: &CrunConfig{
 			BinaryPath: cfg.CrunBinary,
@@ -95,6 +97,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		store:        cfg.Store,
 		images:       cfg.Images,
 		netManager:   cfg.NetworkManager,
+		volResolver:  cfg.VolumeResolver,
 		bundleRoot:   cfg.BundleRoot,
 		active:       make(map[string]*activeContainer),
 		pidMap:       make(map[int]string),
@@ -263,6 +266,8 @@ func (m *Manager) Create(_ context.Context, cfg *container.Config, hostCfg *cont
 }
 
 // buildContainerRecord generates the OCI spec, writes it to disk, and builds an InspectResponse.
+//
+//nolint:gocyclo // Orchestrates the full container record build with sequential steps.
 func (m *Manager) buildContainerRecord(
 	id, name string,
 	cfg *container.Config,
@@ -279,7 +284,7 @@ func (m *Manager) buildContainerRecord(
 	}
 
 	// Build bind mounts for /etc network files.
-	etcBindMounts := []ocispec.Mount{
+	etcBindMounts := []ocispec.Mount{ //nolint:prealloc // Size unknown until volume resolution completes.
 		{
 			Destination: "/etc/hostname",
 			Type:        "bind",
@@ -308,6 +313,26 @@ func (m *Manager) buildContainerRecord(
 			return nil, fmt.Errorf("runtime: create placeholder %s: %w", m.Source, writeErr)
 		}
 	}
+
+	// Resolve VolumesFrom: copy mounts from referenced containers.
+	if hostCfg != nil && len(hostCfg.VolumesFrom) > 0 {
+		extraBinds, vfErr := resolveVolumesFrom(hostCfg.VolumesFrom, m.store)
+		if vfErr != nil {
+			return nil, fmt.Errorf("runtime: %w", vfErr)
+		}
+
+		hostCfg.Binds = append(hostCfg.Binds, extraBinds...)
+	}
+
+	// Process volume/bind/tmpfs mounts.
+	var mountPoints []container.MountPoint
+
+	volMounts, mountPoints, volErr := buildVolumeMounts(cfg, hostCfg, m.volResolver)
+	if volErr != nil {
+		return nil, fmt.Errorf("runtime: %w", volErr)
+	}
+
+	etcBindMounts = append(etcBindMounts, volMounts...)
 
 	// Resolve network namespace path for container:<id> mode.
 	var networkNSPath string
@@ -396,6 +421,7 @@ func (m *Manager) buildContainerRecord(
 		LogPath:        filepath.Join(bundleDir, "json.log"),
 		Config:         cfg,
 		HostConfig:     hostCfg,
+		Mounts:         mountPoints,
 		ResolvConfPath: filepath.Join(bundleDir, "resolv.conf"),
 		HostnamePath:   filepath.Join(bundleDir, "hostname"),
 		HostsPath:      filepath.Join(bundleDir, "hosts"),

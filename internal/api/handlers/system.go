@@ -3,6 +3,7 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/Shikachuu/kogia/internal/events"
 	"github.com/moby/moby/api/types/system"
 	"golang.org/x/sys/unix"
 
@@ -77,6 +79,43 @@ func (h *Handlers) SystemInfo(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, resp)
+}
+
+// SystemEvents handles GET /events — streams NDJSON lifecycle events.
+func (h *Handlers) SystemEvents(w http.ResponseWriter, r *http.Request) {
+	filters := events.ParseFilters(r.URL.Query())
+	sub := h.events.Subscribe(filters)
+
+	defer sub.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	enc := json.NewEncoder(w)
+
+	if flusher != nil {
+		flusher.Flush()
+	}
+
+	for {
+		select {
+		case msg, ok := <-sub.C:
+			if !ok {
+				return
+			}
+
+			if err := enc.Encode(msg); err != nil {
+				return
+			}
+
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func kernelVersion() string {

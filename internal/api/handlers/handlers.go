@@ -3,10 +3,12 @@ package handlers
 
 import (
 	"github.com/Shikachuu/kogia/internal/api/gen"
+	"github.com/Shikachuu/kogia/internal/events"
 	"github.com/Shikachuu/kogia/internal/image"
 	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
+	"github.com/Shikachuu/kogia/internal/volume"
 )
 
 // Handlers implements gen.Handler with moby types.
@@ -17,6 +19,8 @@ type Handlers struct {
 	images           *image.Store
 	runtime          *runtime.Manager
 	network          *network.Manager
+	volumes          *volume.Manager
+	events           *events.Bus
 	version          string
 	commit           string
 	date             string
@@ -24,12 +28,22 @@ type Handlers struct {
 }
 
 // New creates a new Handlers instance.
-func New(s *store.Store, images *image.Store, rt *runtime.Manager, net *network.Manager, version, commit, date, dockerAPIVersion string) *Handlers {
+func New(
+	s *store.Store,
+	images *image.Store,
+	rt *runtime.Manager,
+	net *network.Manager,
+	vols *volume.Manager,
+	eventBus *events.Bus,
+	version, commit, date, dockerAPIVersion string,
+) *Handlers {
 	return &Handlers{
 		store:            s,
 		images:           images,
 		runtime:          rt,
 		network:          net,
+		volumes:          vols,
+		events:           eventBus,
 		version:          version,
 		commit:           commit,
 		date:             date,

@@ -33,6 +33,7 @@ func New(dbPath string) (*Store, error) {
 		bucketMeta,
 		bucketContainers, bucketContNames, bucketContBundles,
 		bucketNetworks, bucketNetworkNames, bucketEndpoints, bucketIPAM,
+		bucketVolumes, bucketVolumeNames,
 	}
 
 	if err = db.Update(func(tx *bolt.Tx) error {

@@ -13,10 +13,12 @@ import (
 	"github.com/Shikachuu/kogia/embed"
 	"github.com/Shikachuu/kogia/internal/api"
 	"github.com/Shikachuu/kogia/internal/api/handlers"
+	"github.com/Shikachuu/kogia/internal/events"
 	"github.com/Shikachuu/kogia/internal/image"
 	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/runtime"
 	"github.com/Shikachuu/kogia/internal/store"
+	"github.com/Shikachuu/kogia/internal/volume"
 )
 
 // Config holds daemon startup configuration.
@@ -113,6 +115,18 @@ func Run(ctx context.Context, cfg *Config) error {
 		}
 	}()
 
+	// Initialize event bus.
+	eventBus := events.New()
+
+	// Initialize volume manager.
+	volumesDir := filepath.Join(cfg.RootDir, "volumes")
+
+	if mkdirErr := os.MkdirAll(volumesDir, 0o710); mkdirErr != nil {
+		return fmt.Errorf("daemon: mkdir volumes: %w", mkdirErr)
+	}
+
+	volMgr := volume.NewManager(s, volumesDir)
+
 	// Initialize runtime manager.
 	crunRootDir := filepath.Join(socketDir, "crun-state")
 
@@ -133,6 +147,7 @@ func Run(ctx context.Context, cfg *Config) error {
 		Store:          s,
 		Images:         images,
 		NetworkManager: netMgr,
+		VolumeResolver: volMgr,
 	})
 
 	// Clean up containers orphaned by a previous crash.
@@ -142,7 +157,7 @@ func Run(ctx context.Context, cfg *Config) error {
 	rt.StartReaper(ctx)
 
 	// Create HTTP handlers and server.
-	h := handlers.New(s, images, rt, netMgr, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
+	h := handlers.New(s, images, rt, netMgr, volMgr, eventBus, cfg.Version, cfg.Commit, cfg.Date, cfg.DockerAPIVersion)
 	srv := api.New(cfg.SocketPath, cfg.DockerAPIVersion, h)
 
 	if err = srv.Start(); err != nil {

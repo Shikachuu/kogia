@@ -9,6 +9,7 @@ import (
 
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/Shikachuu/kogia/internal/image"
+	"github.com/moby/moby/api/types/events"
 	imagetypes "github.com/moby/moby/api/types/image"
 )
 
@@ -40,7 +41,11 @@ func (h *Handlers) ImageCreate(w http.ResponseWriter, r *http.Request) {
 	if err := h.images.Pull(r.Context(), fromImage, tag, auth, w, flusher); err != nil {
 		slog.Error("image pull failed", "image", fromImage, "err", err)
 		image.WriteError(w, flusher, err)
+
+		return
 	}
+
+	h.publishEvent(events.ImageEventType, events.ActionPull, fromImage, map[string]string{"name": fromImage})
 }
 
 // ImageList handles GET /images/json.
@@ -94,6 +99,8 @@ func (h *Handlers) ImageDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publishEvent(events.ImageEventType, events.ActionDelete, name, map[string]string{"name": name})
+
 	respondJSON(w, http.StatusOK, items)
 }
 
@@ -126,6 +133,13 @@ func (h *Handlers) ImageTag(w http.ResponseWriter, r *http.Request) {
 
 		return
 	}
+
+	ref := repo
+	if tag != "" {
+		ref += ":" + tag
+	}
+
+	h.publishEvent(events.ImageEventType, events.ActionTag, name, map[string]string{"name": ref})
 
 	w.WriteHeader(http.StatusCreated)
 }
