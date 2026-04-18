@@ -15,6 +15,11 @@ import (
 	clog "github.com/Shikachuu/kogia/internal/log"
 )
 
+const (
+	streamStdout = "stdout"
+	streamStderr = "stderr"
+)
+
 // ErrStdinNotAvailable is returned when writing to stdin on a container that has no stdin pipe.
 var ErrStdinNotAvailable = errors.New("stdin not available")
 
@@ -106,7 +111,7 @@ func (cio *containerIO) startCopyLoop() {
 		if cio.ptyMaster != nil {
 			cio.wg.Add(1)
 
-			go cio.copyStreamRaw(cio.ptyMaster, "stdout")
+			go cio.copyStreamRaw(cio.ptyMaster, streamStdout)
 		}
 
 		return
@@ -114,8 +119,8 @@ func (cio *containerIO) startCopyLoop() {
 
 	cio.wg.Add(2)
 
-	go cio.copyStream(cio.stdoutRead, "stdout")
-	go cio.copyStream(cio.stderrRead, "stderr")
+	go cio.copyStream(cio.stdoutRead, streamStdout)
+	go cio.copyStream(cio.stderrRead, streamStderr)
 }
 
 // copyStreamRaw reads raw chunks from the PTY master and fans them out to
@@ -260,7 +265,7 @@ func (cio *containerIO) fanOutOrBuffer(data []byte, stream string) {
 // Format: [stream_type, 0, 0, 0, size(4 bytes big-endian)] + payload.
 func stdcopyFrame(stream string, data []byte) []byte {
 	streamType := byte(1) // stdout
-	if stream == "stderr" {
+	if stream == streamStderr {
 		streamType = 2
 	}
 
