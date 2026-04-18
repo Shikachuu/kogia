@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/containers/image/v5/copy"
@@ -18,7 +19,9 @@ import (
 
 // Pull downloads an image from a registry and stores it locally.
 // Progress is streamed as NDJSON to the provided writer.
-func (s *Store) Pull(ctx context.Context, fromImage, tag string, auth *AuthConfig, w io.Writer, flusher http.Flusher) error {
+// The context is intentionally detached from the HTTP request so that a
+// client disconnect does not cancel an in-flight layer copy.
+func (s *Store) Pull(_ context.Context, fromImage, tag string, auth *AuthConfig, w io.Writer, flusher http.Flusher) error {
 	ref, err := buildRef(fromImage, tag)
 	if err != nil {
 		return fmt.Errorf("invalid reference: %w", err)
@@ -59,7 +62,7 @@ func (s *Store) Pull(ctx context.Context, fromImage, tag string, auth *AuthConfi
 
 	writeProgress(pw, &progressMsg{Status: "Pulling from " + reference.FamiliarName(ref), ID: tag})
 
-	_, err = copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
+	_, err = copy.Image(context.Background(), policyCtx, dstRef, srcRef, &copy.Options{ //nolint:contextcheck // Detach from HTTP request so client disconnect does not cancel the pull.
 		ReportWriter:   pw,
 		SourceCtx:      sysCtx,
 		DestinationCtx: &imagetypes.SystemContext{},
@@ -114,13 +117,19 @@ type errorDetail struct {
 }
 
 // progressWriter wraps containers/image progress text into NDJSON objects.
+// It is safe for concurrent use because containers/image copies layers in
+// parallel goroutines that all write to the same ReportWriter.
 type progressWriter struct {
+	mu      sync.Mutex
 	w       io.Writer
 	flusher http.Flusher
 	buf     []byte
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
 	pw.buf = append(pw.buf, p...)
 
 	for {
@@ -136,13 +145,14 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 			continue
 		}
 
-		writeProgress(pw, &progressMsg{Status: line})
+		pw.writeMsg(&progressMsg{Status: line})
 	}
 
 	return len(p), nil
 }
 
-func writeProgress(pw *progressWriter, msg *progressMsg) {
+// writeMsg marshals and writes a single NDJSON message. Must be called with pw.mu held.
+func (pw *progressWriter) writeMsg(msg *progressMsg) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
@@ -154,6 +164,13 @@ func writeProgress(pw *progressWriter, msg *progressMsg) {
 	if pw.flusher != nil {
 		pw.flusher.Flush()
 	}
+}
+
+func writeProgress(pw *progressWriter, msg *progressMsg) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	pw.writeMsg(msg)
 }
 
 // WriteError writes an error as an NDJSON progress message.
