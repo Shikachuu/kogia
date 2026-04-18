@@ -3,9 +3,8 @@ package image
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
@@ -15,7 +14,7 @@ import (
 
 // Push uploads an image to a registry.
 // Progress is streamed as NDJSON to the provided writer.
-func (s *Store) Push(ctx context.Context, nameOrID, tag string, auth *AuthConfig, w io.Writer, flusher http.Flusher) error {
+func (s *Store) Push(ctx context.Context, nameOrID, tag string, auth *AuthConfig, nw *stream.NDJSONWriter) error {
 	// Try resolving with tag appended first — Docker CLI sends name and tag separately.
 	img, err := s.resolveWithTag(nameOrID, tag)
 	if err != nil {
@@ -56,9 +55,9 @@ func (s *Store) Push(ctx context.Context, nameOrID, tag string, auth *AuthConfig
 		}
 	}
 
-	pw := &progressWriter{w: w, flusher: flusher}
+	pw := &progressWriter{nw: nw}
 
-	writeProgress(pw, &progressMsg{Status: "The push refers to repository [" + reference.FamiliarName(ref) + "]"})
+	_ = nw.Encode(&stream.ProgressMsg{Status: "The push refers to repository [" + reference.FamiliarName(ref) + "]"})
 
 	_, err = copy.Image(ctx, policyCtx, dstRef, srcRef, &copy.Options{
 		ReportWriter:   pw,
@@ -69,7 +68,7 @@ func (s *Store) Push(ctx context.Context, nameOrID, tag string, auth *AuthConfig
 		return fmt.Errorf("push image: %w", err)
 	}
 
-	writeProgress(pw, &progressMsg{Status: "Pushed " + reference.FamiliarString(ref)})
+	_ = nw.Encode(&stream.ProgressMsg{Status: "Pushed " + reference.FamiliarString(ref)})
 
 	return nil
 }

@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker/archive"
 	istorage "github.com/containers/image/v5/storage"
@@ -15,7 +15,7 @@ import (
 
 // Load imports images from a Docker archive tar stream.
 // Progress is streamed as NDJSON to the provided writer.
-func (s *Store) Load(ctx context.Context, input io.Reader, w io.Writer, flusher http.Flusher) error {
+func (s *Store) Load(ctx context.Context, input io.Reader, nw *stream.NDJSONWriter) error {
 	tmp, err := os.CreateTemp("", "kogia-load-*.tar")
 	if err != nil {
 		return fmt.Errorf("image load: create temp: %w", err)
@@ -56,7 +56,7 @@ func (s *Store) Load(ctx context.Context, input io.Reader, w io.Writer, flusher 
 
 	defer func() { _ = policyCtx.Destroy() }()
 
-	pw := &progressWriter{w: w, flusher: flusher}
+	pw := &progressWriter{nw: nw}
 
 	for _, refs := range imageList {
 		if len(refs) == 0 {
@@ -73,7 +73,7 @@ func (s *Store) Load(ctx context.Context, input io.Reader, w io.Writer, flusher 
 			refStr = srcRef.StringWithinTransport()
 		}
 
-		writeProgress(pw, &progressMsg{Status: "Loading layer for " + refStr})
+		_ = nw.Encode(&stream.ProgressMsg{Status: "Loading layer for " + refStr})
 
 		dstRef, dstErr := istorage.Transport.ParseStoreReference(s.store, refStr)
 		if dstErr != nil {
@@ -89,7 +89,7 @@ func (s *Store) Load(ctx context.Context, input io.Reader, w io.Writer, flusher 
 			return fmt.Errorf("image load: copy %s: %w", refStr, imgCopyErr)
 		}
 
-		writeProgress(pw, &progressMsg{Status: "Loaded image: " + refStr})
+		_ = nw.Encode(&stream.ProgressMsg{Status: "Loaded image: " + refStr})
 	}
 
 	return nil

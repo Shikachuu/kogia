@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/Shikachuu/kogia/internal/image"
 	"github.com/containers/storage"
 	"github.com/moby/moby/api/types/events"
@@ -34,14 +35,11 @@ func (h *Handlers) ImageCreate(w http.ResponseWriter, r *http.Request) {
 	auth := image.ResolveAuth(r.Header.Get("X-Registry-Auth"), registryFromRef(fromImage))
 
 	// Start streaming response immediately.
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	nw := stream.NewNDJSON(w)
 
-	flusher, _ := w.(http.Flusher)
-
-	if err := h.images.Pull(r.Context(), fromImage, tag, auth, w, flusher); err != nil {
+	if err := h.images.Pull(r.Context(), fromImage, tag, auth, nw); err != nil {
 		slog.Error("image pull failed", "image", fromImage, "err", err)
-		image.WriteError(w, flusher, err)
+		stream.WriteError(nw, err)
 
 		return
 	}
@@ -249,14 +247,11 @@ func (h *Handlers) ImageGetAll(w http.ResponseWriter, r *http.Request) {
 
 // ImageLoad handles POST /images/load (import images from tar).
 func (h *Handlers) ImageLoad(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	nw := stream.NewNDJSON(w)
 
-	flusher, _ := w.(http.Flusher)
-
-	if err := h.images.Load(r.Context(), r.Body, w, flusher); err != nil {
+	if err := h.images.Load(r.Context(), r.Body, nw); err != nil {
 		slog.Error("image load failed", "err", err)
-		image.WriteError(w, flusher, err)
+		stream.WriteError(nw, err)
 	}
 }
 
@@ -267,14 +262,11 @@ func (h *Handlers) ImagePush(w http.ResponseWriter, r *http.Request) {
 
 	auth := image.ResolveAuth(r.Header.Get("X-Registry-Auth"), registryFromRef(name))
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
+	nw := stream.NewNDJSON(w)
 
-	flusher, _ := w.(http.Flusher)
-
-	if err := h.images.Push(r.Context(), name, tag, auth, w, flusher); err != nil {
+	if err := h.images.Push(r.Context(), name, tag, auth, nw); err != nil {
 		slog.Error("image push failed", "image", name, "err", err)
-		image.WriteError(w, flusher, err)
+		stream.WriteError(nw, err)
 	}
 }
 

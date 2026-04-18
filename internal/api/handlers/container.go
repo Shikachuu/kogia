@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/Shikachuu/kogia/internal/image"
 	clog "github.com/Shikachuu/kogia/internal/log"
 	"github.com/Shikachuu/kogia/internal/log/jsonfile"
@@ -391,17 +391,15 @@ func (h *Handlers) ContainerLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer reader.Close()
 
-	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, _ := w.(http.Flusher)
+	sw := stream.NewStdcopy(w)
 
 	for msg := range reader.Lines {
-		writeStdcopyFrame(w, msg)
-
-		if flusher != nil {
-			flusher.Flush()
+		streamType := stream.Stdout
+		if msg.Stream == "stderr" {
+			streamType = stream.Stderr
 		}
+
+		_ = sw.WriteFrame(streamType, msg.Line)
 	}
 }
 
@@ -458,22 +456,6 @@ func logMaxFiles(record *container.InspectResponse) int {
 	return 0
 }
 
-// writeStdcopyFrame writes a Docker stdcopy multiplexed frame.
-// Format: [stream_type, 0, 0, 0, size(4 bytes big-endian)] + payload.
-func writeStdcopyFrame(w http.ResponseWriter, msg *clog.Message) {
-	streamType := byte(1) // stdout
-	if msg.Stream == "stderr" {
-		streamType = 2
-	}
-
-	var header [8]byte
-
-	header[0] = streamType
-	binary.BigEndian.PutUint32(header[4:8], uint32(len(msg.Line))) //nolint:gosec // Log line length is bounded by scanner buffer size.
-
-	_, _ = w.Write(header[:])
-	_, _ = w.Write(msg.Line) //nolint:gosec // Response writer errors are handled by the HTTP server.
-}
 
 // inspectToSummary converts an InspectResponse to a container Summary for listing.
 func inspectToSummary(c *container.InspectResponse) *container.Summary {

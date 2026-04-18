@@ -2,14 +2,11 @@ package image
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"sync"
 
-	"github.com/Shikachuu/kogia/internal/api/errdefs"
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/containers/image/v5/copy"
 	"github.com/containers/image/v5/docker"
 	"github.com/containers/image/v5/docker/reference"
@@ -21,7 +18,7 @@ import (
 // Progress is streamed as NDJSON to the provided writer.
 // The context is intentionally detached from the HTTP request so that a
 // client disconnect does not cancel an in-flight layer copy.
-func (s *Store) Pull(_ context.Context, fromImage, tag string, auth *AuthConfig, w io.Writer, flusher http.Flusher) error {
+func (s *Store) Pull(_ context.Context, fromImage, tag string, auth *AuthConfig, nw *stream.NDJSONWriter) error {
 	ref, err := buildRef(fromImage, tag)
 	if err != nil {
 		return fmt.Errorf("invalid reference: %w", err)
@@ -58,9 +55,9 @@ func (s *Store) Pull(_ context.Context, fromImage, tag string, auth *AuthConfig,
 		}
 	}
 
-	pw := &progressWriter{w: w, flusher: flusher}
+	pw := &progressWriter{nw: nw}
 
-	writeProgress(pw, &progressMsg{Status: "Pulling from " + reference.FamiliarName(ref), ID: tag})
+	_ = nw.Encode(&stream.ProgressMsg{Status: "Pulling from " + reference.FamiliarName(ref), ID: tag})
 
 	_, err = copy.Image(context.Background(), policyCtx, dstRef, srcRef, &copy.Options{ //nolint:contextcheck // Detach from HTTP request so client disconnect does not cancel the pull.
 		ReportWriter:   pw,
@@ -71,7 +68,7 @@ func (s *Store) Pull(_ context.Context, fromImage, tag string, auth *AuthConfig,
 		return fmt.Errorf("copy image: %w", err)
 	}
 
-	writeProgress(pw, &progressMsg{Status: "Status: Downloaded newer image for " + reference.FamiliarString(ref)})
+	_ = nw.Encode(&stream.ProgressMsg{Status: "Status: Downloaded newer image for " + reference.FamiliarString(ref)})
 
 	return nil
 }
@@ -102,28 +99,13 @@ func buildRef(fromImage, tag string) (reference.Named, error) {
 	return reference.TagNameOnly(parsed), nil
 }
 
-// progressMsg is a single NDJSON progress message sent to the Docker client.
-type progressMsg struct {
-	Status         string       `json:"status"`
-	ID             string       `json:"id,omitempty"`
-	Progress       string       `json:"progress,omitempty"`
-	ProgressDetail interface{}  `json:"progressDetail,omitempty"`
-	ErrorDetail    *errorDetail `json:"errorDetail,omitempty"`
-	Error          string       `json:"error,omitempty"`
-}
-
-type errorDetail struct {
-	Message string `json:"message"`
-}
-
 // progressWriter wraps containers/image progress text into NDJSON objects.
 // It is safe for concurrent use because containers/image copies layers in
 // parallel goroutines that all write to the same ReportWriter.
 type progressWriter struct {
-	mu      sync.Mutex
-	w       io.Writer
-	flusher http.Flusher
-	buf     []byte
+	nw  *stream.NDJSONWriter
+	buf []byte
+	mu  sync.Mutex
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
@@ -145,49 +127,8 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 			continue
 		}
 
-		pw.writeMsg(&progressMsg{Status: line})
+		_ = pw.nw.Encode(&stream.ProgressMsg{Status: line})
 	}
 
 	return len(p), nil
-}
-
-// writeMsg marshals and writes a single NDJSON message. Must be called with pw.mu held.
-func (pw *progressWriter) writeMsg(msg *progressMsg) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-
-	_, _ = pw.w.Write(data)
-	_, _ = pw.w.Write([]byte("\n"))
-
-	if pw.flusher != nil {
-		pw.flusher.Flush()
-	}
-}
-
-func writeProgress(pw *progressWriter, msg *progressMsg) {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
-
-	pw.writeMsg(msg)
-}
-
-// WriteError writes an error as an NDJSON progress message.
-// For errdefs errors the client-safe message is used. For plain errors a
-// generic message is sent to prevent leaking internal details.
-func WriteError(w io.Writer, flusher http.Flusher, err error) {
-	msg := errdefs.SafeMessage(err)
-
-	// If the error is not an errdefs type, it's an internal error —
-	// replace with a generic message (the caller already logged the real error).
-	if errdefs.StatusCode(err) == http.StatusInternalServerError {
-		msg = "internal server error"
-	}
-
-	pw := &progressWriter{w: w, flusher: flusher}
-	writeProgress(pw, &progressMsg{
-		ErrorDetail: &errorDetail{Message: msg},
-		Error:       msg,
-	})
 }

@@ -3,7 +3,6 @@ package runtime
 import (
 	"bufio"
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	apistream "github.com/Shikachuu/kogia/internal/api/stream"
 	clog "github.com/Shikachuu/kogia/internal/log"
 )
 
@@ -244,8 +244,14 @@ func (cio *containerIO) fanOutOrBuffer(data []byte, stream string) {
 
 	// For non-TTY, wrap with stdcopy header so Docker CLI can parse the stream.
 	out := data
+
 	if !cio.tty {
-		out = stdcopyFrame(stream, data)
+		streamType := apistream.Stdout
+		if stream == streamStderr {
+			streamType = apistream.Stderr
+		}
+
+		out = apistream.Frame(streamType, data)
 	}
 
 	if len(cio.attachOut) == 0 && !cio.attachBufFlushed {
@@ -259,22 +265,6 @@ func (cio *containerIO) fanOutOrBuffer(data []byte, stream string) {
 			slog.Debug("attach writer error", "stream", stream, "err", wErr)
 		}
 	}
-}
-
-// stdcopyFrame wraps data in a Docker stdcopy multiplexed frame.
-// Format: [stream_type, 0, 0, 0, size(4 bytes big-endian)] + payload.
-func stdcopyFrame(stream string, data []byte) []byte {
-	streamType := byte(1) // stdout
-	if stream == streamStderr {
-		streamType = 2
-	}
-
-	frame := make([]byte, 8+len(data))
-	frame[0] = streamType
-	binary.BigEndian.PutUint32(frame[4:8], uint32(len(data))) //nolint:gosec // Line length is bounded by scanner buffer size.
-	copy(frame[8:], data)
-
-	return frame
 }
 
 // WriterFds returns the file descriptors to pass to crun as stdout and stderr.

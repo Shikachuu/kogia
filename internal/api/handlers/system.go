@@ -3,7 +3,6 @@ package handlers
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/Shikachuu/kogia/internal/api/stream"
 	"github.com/Shikachuu/kogia/internal/events"
 	"github.com/moby/moby/api/types/system"
 	"golang.org/x/sys/unix"
@@ -88,15 +88,7 @@ func (h *Handlers) SystemEvents(w http.ResponseWriter, r *http.Request) {
 
 	defer sub.Close()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-
-	flusher, _ := w.(http.Flusher)
-	enc := json.NewEncoder(w)
-
-	if flusher != nil {
-		flusher.Flush()
-	}
+	nw := stream.NewNDJSON(w)
 
 	for {
 		select {
@@ -105,12 +97,8 @@ func (h *Handlers) SystemEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			if err := enc.Encode(msg); err != nil {
+			if err := nw.Encode(msg); err != nil {
 				return
-			}
-
-			if flusher != nil {
-				flusher.Flush()
 			}
 		case <-r.Context().Done():
 			return
