@@ -9,6 +9,7 @@ import (
 
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/Shikachuu/kogia/internal/image"
+	"github.com/containers/storage"
 	"github.com/moby/moby/api/types/events"
 	imagetypes "github.com/moby/moby/api/types/image"
 )
@@ -90,6 +91,12 @@ func (h *Handlers) ImageDelete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, image.ErrNotFound) {
 			respondError(w, errdefs.NotFound("no such image: "+name, err))
+
+			return
+		}
+
+		if errors.Is(err, storage.ErrImageUsedByContainer) {
+			respondError(w, errdefs.Conflict("image is being used by a container", err))
 
 			return
 		}
