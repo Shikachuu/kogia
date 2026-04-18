@@ -507,6 +507,39 @@ func inspectToSummary(c *container.InspectResponse) *container.Summary {
 
 	s.Mounts = c.Mounts
 
+	if c.NetworkSettings != nil {
+		for port, bindings := range c.NetworkSettings.Ports {
+			if len(bindings) == 0 {
+				s.Ports = append(s.Ports, container.PortSummary{
+					PrivatePort: port.Num(),
+					Type:        string(port.Proto()),
+				})
+
+				continue
+			}
+
+			for _, b := range bindings {
+				ps := container.PortSummary{
+					PrivatePort: port.Num(),
+					Type:        string(port.Proto()),
+					IP:          b.HostIP,
+				}
+
+				if hp, err := strconv.ParseUint(b.HostPort, 10, 16); err == nil {
+					ps.PublicPort = uint16(hp)
+				}
+
+				s.Ports = append(s.Ports, ps)
+			}
+		}
+
+		if c.NetworkSettings.Networks != nil {
+			s.NetworkSettings = &container.NetworkSettingsSummary{
+				Networks: c.NetworkSettings.Networks,
+			}
+		}
+	}
+
 	return s
 }
 

@@ -1461,24 +1461,45 @@ func (m *Manager) setupContainerNetworking(record *container.InspectResponse, bu
 	}
 
 	// Populate NetworkSettings so `docker inspect` shows network info.
+	if record.NetworkSettings == nil || record.NetworkSettings.Networks == nil {
+		record.NetworkSettings = &container.NetworkSettings{
+			Networks: make(map[string]*mobynetwork.EndpointSettings),
+		}
+	}
+
 	if ep != nil && ep.IPAddress.IsValid() {
 		mac, _ := netPkg.ParseMAC(ep.MacAddress)
 
-		record.NetworkSettings = &container.NetworkSettings{
-			Networks: map[string]*mobynetwork.EndpointSettings{
-				networkName: {
-					NetworkID:   netRec.ID,
-					Gateway:     netRec.Gateway,
-					IPAddress:   ep.IPAddress,
-					IPPrefixLen: netRec.Subnet.Bits(),
-					MacAddress:  mobynetwork.HardwareAddr(mac),
-				},
-			},
+		record.NetworkSettings.Networks[networkName] = &mobynetwork.EndpointSettings{
+			NetworkID:   netRec.ID,
+			Gateway:     netRec.Gateway,
+			IPAddress:   ep.IPAddress,
+			IPPrefixLen: netRec.Subnet.Bits(),
+			MacAddress:  mobynetwork.HardwareAddr(mac),
+		}
+	}
+
+	// Populate NetworkSettings.Ports from resolved port mappings.
+	if len(portMappings) > 0 {
+		ports := make(mobynetwork.PortMap)
+
+		for _, pm := range portMappings {
+			port, ok := mobynetwork.PortFrom(pm.ContainerPort, mobynetwork.IPProtocol(pm.Protocol))
+			if !ok {
+				continue
+			}
+
+			ports[port] = append(ports[port], mobynetwork.PortBinding{
+				HostIP:   pm.HostIP,
+				HostPort: strconv.FormatUint(uint64(pm.HostPort), 10),
+			})
 		}
 
-		if updateErr := m.store.UpdateContainer(record); updateErr != nil {
-			slog.Warn("failed to update container network settings", "id", record.ID[:12], "err", updateErr)
-		}
+		record.NetworkSettings.Ports = ports
+	}
+
+	if updateErr := m.store.UpdateContainer(record); updateErr != nil {
+		slog.Warn("failed to update container network settings", "id", record.ID[:12], "err", updateErr)
 	}
 
 	// Update hosts files for other containers on this network.

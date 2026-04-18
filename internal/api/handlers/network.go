@@ -10,6 +10,7 @@ import (
 	"github.com/Shikachuu/kogia/internal/api/errdefs"
 	"github.com/Shikachuu/kogia/internal/network"
 	"github.com/Shikachuu/kogia/internal/store"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	mobynetwork "github.com/moby/moby/api/types/network"
 )
@@ -162,10 +163,32 @@ func (h *Handlers) NetworkConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, connectErr := h.network.Connect(netRec.ID, record.ID, record.Name, record.State.Pid, nil); connectErr != nil {
+	ep, connectErr := h.network.Connect(netRec.ID, record.ID, record.Name, record.State.Pid, nil)
+	if connectErr != nil {
 		respondError(w, connectErr)
 
 		return
+	}
+
+	// Update container NetworkSettings with the new network endpoint.
+	if ep != nil && ep.IPAddress.IsValid() {
+		if record.NetworkSettings == nil || record.NetworkSettings.Networks == nil {
+			record.NetworkSettings = &container.NetworkSettings{
+				Networks: make(map[string]*mobynetwork.EndpointSettings),
+			}
+		}
+
+		mac, _ := net.ParseMAC(ep.MacAddress)
+
+		record.NetworkSettings.Networks[netRec.Name] = &mobynetwork.EndpointSettings{
+			NetworkID:   netRec.ID,
+			Gateway:     netRec.Gateway,
+			IPAddress:   ep.IPAddress,
+			IPPrefixLen: netRec.Subnet.Bits(),
+			MacAddress:  mobynetwork.HardwareAddr(mac),
+		}
+
+		_ = h.store.UpdateContainer(record)
 	}
 
 	h.publishEvent(events.NetworkEventType, events.ActionConnect, netRec.ID, map[string]string{
@@ -205,6 +228,13 @@ func (h *Handlers) NetworkDisconnect(w http.ResponseWriter, r *http.Request) {
 		respondError(w, disconnErr)
 
 		return
+	}
+
+	// Remove network from container's NetworkSettings.
+	ctr, ctrErr := h.store.GetContainer(req.Container)
+	if ctrErr == nil && ctr.NetworkSettings != nil && ctr.NetworkSettings.Networks != nil {
+		delete(ctr.NetworkSettings.Networks, netRec.Name)
+		_ = h.store.UpdateContainer(ctr)
 	}
 
 	h.publishEvent(events.NetworkEventType, events.ActionDisconnect, netRec.ID, map[string]string{
