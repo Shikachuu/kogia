@@ -1,11 +1,16 @@
 package image
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/containers/image/v5/docker"
+	imagetypes "github.com/containers/image/v5/types"
 )
 
 // AuthConfig holds registry credentials for image operations.
@@ -113,6 +118,26 @@ func AuthFromDockerConfig(registry string) *AuthConfig {
 		Password:      password,
 		ServerAddress: registry,
 	}
+}
+
+// CheckAuth validates registry credentials by hitting the registry's /v2/ endpoint.
+// Returns nil on success, or the raw error from the registry check.
+// Callers should use errors.As with docker.ErrUnauthorizedForCredentials to
+// distinguish auth failures from network errors.
+func (s *Store) CheckAuth(ctx context.Context, auth *AuthConfig) error {
+	if auth.IdentityToken != "" {
+		// Identity tokens are opaque; we can't validate them server-side
+		// without a full OAuth flow. Accept and let the CLI persist them.
+		return nil
+	}
+
+	sysCtx := &imagetypes.SystemContext{}
+
+	if err := docker.CheckAuth(ctx, sysCtx, auth.Username, auth.Password, auth.ServerAddress); err != nil {
+		return fmt.Errorf("auth: check credentials for %s: %w", auth.ServerAddress, err)
+	}
+
+	return nil
 }
 
 // ResolveAuth returns credentials using the priority: header → config.json → nil.

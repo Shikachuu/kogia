@@ -71,6 +71,33 @@ func TestConflict(t *testing.T) {
 	}
 }
 
+func TestUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	internal := errors.New("registry: invalid credentials")
+	err := Unauthorized("unauthorized: incorrect username or password", internal)
+
+	if err.Error() != "unauthorized: incorrect username or password" {
+		t.Errorf("Error() = %q, want %q", err.Error(), "unauthorized: incorrect username or password")
+	}
+
+	if !IsUnauthorized(err) {
+		t.Error("IsUnauthorized should return true")
+	}
+
+	if IsInvalidParameter(err) || IsNotFound(err) || IsConflict(err) {
+		t.Error("should not match other types")
+	}
+
+	if StatusCode(err) != http.StatusUnauthorized {
+		t.Errorf("StatusCode = %d, want %d", StatusCode(err), http.StatusUnauthorized)
+	}
+
+	if !errors.Is(InternalErr(err), internal) {
+		t.Errorf("InternalError = %v, want %v", InternalErr(err), internal)
+	}
+}
+
 func TestOpaqueBoundary(t *testing.T) {
 	t.Parallel()
 

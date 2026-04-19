@@ -32,6 +32,7 @@ var (
 	_ SafeError = (*InvalidParameterError)(nil)
 	_ SafeError = (*NotFoundError)(nil)
 	_ SafeError = (*ConflictError)(nil)
+	_ SafeError = (*UnauthorizedError)(nil)
 )
 
 // InvalidParameterError represents a client input validation failure (→ 400).
@@ -64,6 +65,16 @@ func (e *ConflictError) Error() string        { return e.Msg }
 func (e *ConflictError) Unwrap() error        { return nil }
 func (e *ConflictError) InternalError() error { return e.Internal }
 
+// UnauthorizedError represents an authentication failure (→ 401).
+type UnauthorizedError struct {
+	Internal error
+	Msg      string
+}
+
+func (e *UnauthorizedError) Error() string        { return e.Msg }
+func (e *UnauthorizedError) Unwrap() error        { return nil }
+func (e *UnauthorizedError) InternalError() error { return e.Internal }
+
 // InvalidParameter creates a 400 error with a safe message and an internal cause.
 func InvalidParameter(msg string, internal error) error {
 	return &InvalidParameterError{Msg: msg, Internal: internal}
@@ -77,6 +88,11 @@ func NotFound(msg string, internal error) error {
 // Conflict creates a 409 error with a safe message and an internal cause.
 func Conflict(msg string, internal error) error {
 	return &ConflictError{Msg: msg, Internal: internal}
+}
+
+// Unauthorized creates a 401 error with a safe message and an internal cause.
+func Unauthorized(msg string, internal error) error {
+	return &UnauthorizedError{Msg: msg, Internal: internal}
 }
 
 // IsInvalidParameter reports whether err is an InvalidParameterError.
@@ -100,12 +116,21 @@ func IsConflict(err error) bool {
 	return errors.As(err, &target)
 }
 
+// IsUnauthorized reports whether err is an UnauthorizedError.
+func IsUnauthorized(err error) bool {
+	var target *UnauthorizedError
+
+	return errors.As(err, &target)
+}
+
 // StatusCode maps an error to the appropriate HTTP status code.
 // Unrecognized errors default to 500 Internal Server Error.
 func StatusCode(err error) int {
 	switch {
 	case IsInvalidParameter(err):
 		return http.StatusBadRequest
+	case IsUnauthorized(err):
+		return http.StatusUnauthorized
 	case IsNotFound(err):
 		return http.StatusNotFound
 	case IsConflict(err):

@@ -1,6 +1,7 @@
 package image
 
 import (
+	"context"
 	"encoding/base64"
 	"os"
 	"path/filepath"
@@ -68,6 +69,45 @@ func TestAuthFromHeader(t *testing.T) {
 
 			if auth.Username != tt.wantUser {
 				t.Errorf("username = %q, want %q", auth.Username, tt.wantUser)
+			}
+		})
+	}
+}
+
+func TestCheckAuth(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		auth    *AuthConfig
+		name    string
+		wantErr bool
+	}{
+		{
+			name:    "identity token skips registry validation",
+			auth:    &AuthConfig{IdentityToken: "opaque-token-123"},
+			wantErr: false,
+		},
+		{
+			name:    "identity token with empty username",
+			auth:    &AuthConfig{IdentityToken: "tok", Username: "", Password: ""},
+			wantErr: false,
+		},
+		{
+			name:    "bad credentials against unreachable registry",
+			auth:    &AuthConfig{Username: "user", Password: "pass", ServerAddress: "localhost:1"},
+			wantErr: true,
+		},
+	}
+
+	s := &Store{}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := s.CheckAuth(context.Background(), tt.auth)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CheckAuth() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
